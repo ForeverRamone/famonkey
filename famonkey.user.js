@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.2.0
+// @version      1.3.0
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
@@ -221,6 +221,7 @@
             original: kind === 'movie' ? r.original_title  : r.original_name,
             year: date ? parseInt(date.slice(0, 4), 10) || null : null,
             popularity: r.popularity || 0,
+            paises: r.origin_country || [],
             poster: r.poster_path || null,
             overview: r.overview || ''
         };
@@ -299,6 +300,35 @@
         return out;
     }
 
+    // FilmAffinity abre una ficha por temporada: "Euphoria T3", "The White Lotus 3",
+    // y en el título original el marcador es "S3". Sonarr, en cambio, tiene una
+    // sola ficha por serie con las temporadas dentro, así que para encontrarla
+    // hay que quitar el marcador y quedarse con el número.
+    const RE_TEMPORADA = [
+        /\s*[-\u2013:]?\s*(?:temporada|season)\s+(\d{1,2})\s*$/i,
+        /\s+[TS]\s?(\d{1,2})\s*$/i,
+        /\s+(\d{1,2})\s*$/
+    ];
+
+    function quitarTemporada(titulo) {
+        const t = String(titulo || '').replace(/\s+/g, ' ').trim();
+        for (const re of RE_TEMPORADA) {
+            const m = re.exec(t);
+            if (m) {
+                const base = t.slice(0, m.index).trim();
+                if (base) return { titulo: base, temporada: parseInt(m[1], 10) };
+            }
+        }
+        return { titulo: t, temporada: null };
+    }
+
+    // La bandera del país está en la ruta de su imagen: /imgs/countries2/US.png
+    function paisDe(nodo) {
+        const img = nodo ? nodo.querySelector('img.nflag') : null;
+        const m = img ? /\/countries2\/([A-Z]{2})\./.exec(img.getAttribute('src') || '') : null;
+        return m ? m[1] : '';
+    }
+
     function pickText(el) {
         return el ? el.textContent.replace(/\s+/g, ' ').trim() : '';
     }
@@ -315,7 +345,8 @@
             title: cleanTitle(rawTitle),
             type: detectType(typeHint),
             year: yearEl ? parseInt(pickText(yearEl), 10) || null : null,
-            slug: slugFromImg(img)
+            slug: slugFromImg(img),
+            pais: paisDe(card)
         };
     }
 
@@ -379,7 +410,8 @@
             original: original || '',
             type: type,
             year: year,
-            director: director
+            director: director,
+            pais: paisDe(dl || doc.body)
         };
     }
 
@@ -404,9 +436,44 @@
         return ['movie'];   // películas y cortometrajes
     }
 
+    function normalizarSerie(meta) {
+        if (meta.type !== 'tv') return meta;
+
+        const porTitulo  = quitarTemporada(meta.title);
+        const original   = meta.original || (meta.slug ? slugTitles(meta.slug)[0] : '');
+        const porOriginal = quitarTemporada(original);
+        const temporada  = porTitulo.temporada || porOriginal.temporada || null;
+
+        // Algunas temporadas no llevan número sino nombre: "True Detective:
+        // Noche polar" es la cuarta de "True Detective". Lo que va delante de
+        // los dos puntos vale como candidato de reserva.
+        const variantes = [];
+        const corte = porTitulo.titulo.lastIndexOf(':');
+        if (corte > 0) {
+            const prefijo = porTitulo.titulo.slice(0, corte).trim();
+            if (prefijo && norm(prefijo) !== norm(porTitulo.titulo)) variantes.push(prefijo);
+        }
+
+        return Object.assign({}, meta, {
+            title: porTitulo.titulo,
+            original: porOriginal.titulo,
+            slug: '',                     // ya aprovechado, y traía el marcador
+            season: temporada,
+            variantes: variantes,
+            // Sin recortar. Se consulta antes que nada, por si la serie se
+            // llama así de verdad y el número no era una temporada.
+            literal: temporada ? meta.title : '',
+            // El año de la ficha es el de esa temporada, no el del estreno de la
+            // serie. Solo coincide en la primera, así que en las demás estorba.
+            year: (temporada && temporada > 1) ? null : meta.year
+        });
+    }
+
     function scoreCandidates(entries, meta) {
         const nOriginal = norm(meta.original || (meta.slug ? slugTitles(meta.slug)[0] : ''));
         const nTitle = norm(meta.title);
+        const nLiteral = norm(meta.literal);
+        const variantes = (meta.variantes || []).map(norm);
         const list = entries.map(function (e) {
             const r = e.item;
             const no = norm(r.original);
@@ -416,7 +483,9 @@
             if (nOriginal && (no === nOriginal || nt === nOriginal)) s += 6;
             else if (nOriginal && no && (no.indexOf(nOriginal) === 0 || nOriginal.indexOf(no) === 0)) s += 2;
 
-            if (nTitle && (nt === nTitle || no === nTitle)) s += 5;
+            if (nLiteral && (nt === nLiteral || no === nLiteral)) s += 6;
+            else if (nTitle && (nt === nTitle || no === nTitle)) s += 5;
+            else if (variantes.length && (variantes.indexOf(nt) !== -1 || variantes.indexOf(no) !== -1)) s += 4;
 
             if (e.hits > 1) s += 3;   // aparece en varias búsquedas distintas
 
@@ -424,8 +493,11 @@
                 const d = Math.abs(meta.year - r.year);
                 if (d === 0) s += 4;
                 else if (d === 1) s += 1;
-                else s -= 4;
+                else if (meta.type !== 'tv') s -= 4;   // en series el año es el de la temporada
             }
+
+            // El país desempata series homónimas de distintos orígenes.
+            if (meta.pais && r.paises && r.paises.indexOf(meta.pais) !== -1) s += 3;
 
             s += Math.min(r.popularity, 40) / 40;   // desempate suave
             return { item: r, score: s };
@@ -452,9 +524,11 @@
             if (!clean) return;
             if (!queries.some(function (x) { return norm(x) === norm(clean); })) queries.push(clean);
         }
+        addQuery(meta.literal);
         addQuery(meta.original);
         slugTitles(meta.slug).forEach(addQuery);
         addQuery(meta.title);
+        (meta.variantes || []).forEach(addQuery);
 
         const pool = seed || new Map();
         let scored = scoreCandidates(Array.from(pool.values()), meta);
@@ -481,8 +555,12 @@
         return { match: null, candidates: topItems(scored), pool: pool };
     }
 
-    async function resolveMatch(meta) {
-        const cached = store.map[meta.faId];
+    async function resolveMatch(metaCruda) {
+        // Se normaliza siempre lo último que se sepa del título: los datos de la
+        // ficha pisan a los de la tarjeta y volverían a traer el "T3" y el año
+        // de la temporada si se normalizara antes de mezclarlos.
+        const meta = normalizarSerie(metaCruda);
+        const cached = store.map[metaCruda.faId];
         if (cached) {
             if (cached.none) return { match: null, candidates: [], ignored: true, meta: meta };
             return {
@@ -492,16 +570,16 @@
             };
         }
 
-        let full = Object.assign({}, meta, store.meta[meta.faId] || {});
+        let full = normalizarSerie(Object.assign({}, metaCruda, store.meta[metaCruda.faId] || {}));
         let out = await attemptMatch(full);
 
         // Sin coincidencia clara: la ficha aporta título original, año y dirección.
-        if (!out.match && !store.meta[meta.faId]) {
-            const extra = await fetchFicha(meta.faId);
+        if (!out.match && !store.meta[metaCruda.faId]) {
+            const extra = await fetchFicha(metaCruda.faId);
             if (extra) {
-                store.meta[meta.faId] = extra;
+                store.meta[metaCruda.faId] = extra;
                 flushSoon();
-                full = Object.assign({}, full, extra);
+                full = normalizarSerie(Object.assign({}, metaCruda, extra));
 
                 const pool = out.pool || new Map();
                 const rescored = scoreCandidates(Array.from(pool.values()), full);
@@ -514,7 +592,7 @@
         }
 
         if (out.match) {
-            store.map[meta.faId] = { k: out.match.kind, i: out.match.id, t: out.match.title, y: out.match.year };
+            store.map[metaCruda.faId] = { k: out.match.kind, i: out.match.id, t: out.match.title, y: out.match.year };
             flushSoon();
         }
         out.meta = full;
@@ -633,12 +711,22 @@
         const byTvdb = {}, byTmdb = {};
         for (const s of list) {
             const st = s.statistics || {};
+            const temporadas = {};
+            (s.seasons || []).forEach(function (t) {
+                const et = t.statistics || {};
+                temporadas[t.seasonNumber] = {
+                    files: et.episodeFileCount || 0,
+                    total: et.totalEpisodeCount || 0,
+                    mon: t.monitored ? 1 : 0
+                };
+            });
             const ref = {
                 id: s.id,
                 files: st.episodeFileCount || 0,
                 total: st.totalEpisodeCount || st.episodeCount || 0,
                 mon: s.monitored ? 1 : 0,
-                slug: s.titleSlug || ''
+                slug: s.titleSlug || '',
+                temporadas: temporadas
             };
             if (s.tvdbId) byTvdb[s.tvdbId] = ref;
             if (s.tmdbId) byTmdb[s.tmdbId] = ref;
@@ -689,7 +777,7 @@
      * 7. Estado de un título
      * ================================================================== */
 
-    async function statusFor(match) {
+    async function statusFor(match, temporada) {
         const plex = (IDX.plex && IDX.plex.guid) ? IDX.plex : null;
         let hit = plex ? plex.guid['tmdb:' + match.id] : null;
         let arr = null;
@@ -714,14 +802,27 @@
             hit = plex.byTitle[norm(match.title) + '|' + match.year] || null;
         }
 
+        let estado;
         if (hit) {
-            return { state: 'plex', ratingKey: hit.r, machine: plex.machine || '', arr: arr, tvdb: tvdb };
-        }
-        if (arr) {
+            estado = { state: 'plex', ratingKey: hit.r, machine: plex.machine || '', arr: arr, tvdb: tvdb };
+        } else if (arr) {
             const hasFiles = match.kind === 'tv' ? arr.files > 0 : arr.files === 1;
-            return { state: hasFiles ? 'downloaded' : 'queued', arr: arr, tvdb: tvdb };
+            estado = { state: hasFiles ? 'downloaded' : 'queued', arr: arr, tvdb: tvdb };
+        } else {
+            estado = { state: 'missing', tvdb: tvdb };
         }
-        return { state: 'missing', tvdb: tvdb };
+
+        // FilmAffinity abre una ficha por temporada. Si se sabe cuál es y Sonarr
+        // tiene la serie, se mira esa temporada en concreto: tener la serie no
+        // significa tener justo la temporada que estás mirando.
+        if (temporada && arr && arr.temporadas && (estado.state === 'plex' || estado.state === 'downloaded')) {
+            const t = arr.temporadas[temporada];
+            if (t && t.files === 0) {
+                estado = { state: 'queued', arr: arr, tvdb: tvdb, temporadaVacia: temporada };
+            }
+        }
+        estado.temporada = temporada || null;
+        return estado;
     }
 
     /* ================================================================== *
@@ -1044,11 +1145,15 @@
     async function applyStatus(chip) {
         const match = chip._match;
         if (!match) return;
-        const st = await statusFor(match);
+        const temporada = (chip._meta && chip._meta.season) || null;
+        const st = await statusFor(match, temporada);
         chip._status = st;
         const service = match.kind === 'tv' ? 'Sonarr' : 'Radarr';
-        const name = (match.title || '') + (match.year ? ' (' + match.year + ')' : '');
-        if (st.state === 'plex') {
+        const coletilla = temporada ? ' T' + temporada : '';
+        const name = (match.title || '') + coletilla + (match.year ? ' (' + match.year + ')' : '');
+        if (st.temporadaVacia) {
+            setChip(chip, 'queued', 'Tienes la serie, pero no la temporada ' + st.temporadaVacia + ': ' + (match.title || ''));
+        } else if (st.state === 'plex') {
             setChip(chip, 'plex', 'En Plex: ' + name);
         } else if (st.state === 'downloaded') {
             setChip(chip, 'downloaded', 'Descargada en ' + service + ', aun no visible en Plex: ' + name);

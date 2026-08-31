@@ -50,7 +50,7 @@ la restricción de verdad la impone el script.
 |---|---|---|
 | Ámbar, `▸ PLEX` | Está en tu servidor | Abre la ficha en Plex |
 | Verde, `✔` | Descargada en Radarr/Sonarr, aún no visible en Plex | Abre la ficha en Radarr/Sonarr |
-| Naranja oscuro, `↓` | Monitorizada, todavía sin archivo | Abre la ficha en Radarr/Sonarr |
+| Naranja oscuro, `↓` | Monitorizada, todavía sin archivo; o tienes la serie pero no esa temporada | Abre la ficha en Radarr/Sonarr |
 | Azul, `+R` / `+S` | No la tienes | La envía a Radarr o a Sonarr |
 | Gris, `?` | TMDB no ha dado una coincidencia fiable | Abre el selector de candidatos |
 | Rojo, `!` | Error; el motivo está en el tooltip | Reintenta |
@@ -77,6 +77,31 @@ original, y reevalúa los candidatos que ya tenía sin repetir las búsquedas.
 Película o serie se decide por el marcador que FilmAffinity pone en el título:
 `(Serie de TV)` y `(Miniserie de TV)` van a Sonarr; el resto, incluidos los
 cortometrajes `(C)` y los telefilmes `(TV)`, a Radarr.
+
+### Series con una ficha por temporada
+
+FilmAffinity abre una ficha distinta para cada temporada: *Euphoria T3*, *Los
+Bridgerton T4*, *The White Lotus 3*. Sonarr, en cambio, tiene una sola ficha por
+serie con las temporadas dentro, así que el script quita el marcador y busca la
+serie: `T3`, `S3` (que es como aparece en el título original), un número suelto
+al final, o *Temporada 3*.
+
+Dos detalles que se derivan de eso:
+
+- **El año que muestra FilmAffinity es el de esa temporada**, no el del estreno
+  de la serie. *Los Bridgerton T4* pone 2026 y la serie es de 2020. Por eso, en
+  series, que el año coincida suma pero que no coincida no resta.
+- **Hay temporadas con nombre en vez de número**, como *True Detective: Noche
+  polar*, que es la cuarta de *True Detective*. Si el título completo no da con
+  nada, se prueba con lo que va delante de los dos puntos.
+
+Cuando una serie se llama de verdad con un número al final, como *Babylon 5*, no
+hay problema: el título tal cual se consulta antes que el recortado y tiene
+preferencia.
+
+Sabiendo la temporada, el distintivo afina: si tienes la serie en Plex pero
+Sonarr dice que esa temporada no tiene ningún episodio, sale en ámbar y el
+texto lo aclara, en vez de darte un verde que te haría creer que la tienes.
 
 ## Si los distintivos funcionan pero el envío da "tiempo de espera agotado"
 

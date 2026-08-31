@@ -78,6 +78,67 @@ Película o serie se decide por el marcador que FilmAffinity pone en el título:
 `(Serie de TV)` y `(Miniserie de TV)` van a Sonarr; el resto, incluidos los
 cortometrajes `(C)` y los telefilmes `(TV)`, a Radarr.
 
+## Si los distintivos funcionan pero el envío da "tiempo de espera agotado"
+
+Radarr y Sonarr no guardan los metadatos de las películas: los piden a
+servidores propios cada vez que buscas o añades algo.
+
+| Servicio | Servidor de metadatos | IP |
+|---|---|---|
+| Radarr | `api.radarr.video`, `radarr.servarr.com` | `188.114.96.5` (Cloudflare) |
+| Sonarr | `skyhook.sonarr.tv` | `104.26.0.163` (Cloudflare) |
+
+En España, las órdenes judiciales de LaLiga hacen que los operadores bloqueen
+por IP rangos enteros de Cloudflare durante los partidos, y `188.114.96.0/20`
+es uno de los habituales. El bloqueo es un agujero negro: la conexión no se
+rechaza, simplemente no contesta nunca, así que Radarr se queda esperando y tu
+petición acaba en tiempo de espera agotado.
+
+Que TMDB siga funcionando no es casualidad ni contradice nada: **TMDB no está en
+Cloudflare** (usa CloudFront y BunnyCDN), y Letterboxd y FilmAffinity sí lo
+están, pero en rangos distintos que no suelen entrar en el bloqueo.
+
+Los distintivos siguen apareciendo bien porque el estado sale de la base de
+datos local de Radarr, que no depende de internet. Lo único que se rompe es
+añadir películas.
+
+### Comprobarlo
+
+Desde la máquina donde corre Radarr:
+
+```bash
+curl -m 5 https://api.radarr.video/v1/movie/603
+```
+
+Si se queda colgado y con `curl -m 5 --resolve api.radarr.video:443:104.26.0.163
+https://api.radarr.video/v1/movie/603` responde al instante, es este problema.
+
+### Solución
+
+Como el bloqueo es por IP y Cloudflare enruta por SNI, cualquier IP suya no
+bloqueada sirve el mismo contenido. Basta con fijarla en el fichero `hosts`
+**de la máquina que ejecuta Radarr**, no la del navegador:
+
+```
+104.26.0.163 api.radarr.video
+104.26.0.163 radarr.servarr.com
+```
+
+En Linux es `/etc/hosts`; en Windows, `C:\Windows\System32\drivers\etc\hosts`
+como administrador. Si Radarr corre en Docker, en el `docker-compose.yml`:
+
+```yaml
+services:
+  radarr:
+    extra_hosts:
+      - "api.radarr.video:104.26.0.163"
+      - "radarr.servarr.com:104.26.0.163"
+```
+
+No es una solución definitiva: si algún día bloquean también esa IP, busca otra
+de Cloudflare que responda y cámbiala. Las alternativas son una VPN en la
+máquina de Radarr, o enrutar solo ese dominio por otra salida.
+
 ## Menú de Tampermonkey
 
 - **Ajustes**: el panel de configuración.

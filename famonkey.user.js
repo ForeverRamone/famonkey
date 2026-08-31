@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.1.0
+// @version      1.2.0
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
@@ -728,6 +728,20 @@
      * 8. Alta en Radarr y Sonarr
      * ================================================================== */
 
+    // Radarr y Sonarr no guardan los metadatos: los piden a servidores propios
+    // (api.radarr.video, skyhook.sonarr.tv). Si esos están inalcanzables, la
+    // petición se queda colgada aunque el servicio local responda de sobra, y
+    // el error por defecto haría pensar que el problema es la red de casa.
+    function errorDeMetadatos(err, servicio, indice) {
+        const colgada = /tiempo de espera/i.test(err && err.message ? err.message : '');
+        const localResponde = indice && !indice.error;
+        if (colgada && localResponde) {
+            return new Error(servicio + ' responde, pero no alcanza su servidor de metadatos. ' +
+                             'Suele ser un bloqueo de IPs de Cloudflare: mira el README.');
+        }
+        return err;
+    }
+
     async function addToRadarr(match) {
         if (!CFG.radarrKey) throw new Error('Falta la API key de Radarr');
         if (!CFG.radarrProfileId || !CFG.radarrRoot) throw new Error('Configura perfil de calidad y carpeta raíz de Radarr');
@@ -735,10 +749,16 @@
         const root = base(CFG.radarrUrl);
         const hdr = { 'X-Api-Key': CFG.radarrKey, 'Content-Type': 'application/json' };
 
-        const found = await gmJSON({
-            url: root + '/api/v3/movie/lookup?term=' + encodeURIComponent('tmdb:' + match.id),
-            headers: hdr
-        });
+        let found;
+        try {
+            found = await gmJSON({
+                url: root + '/api/v3/movie/lookup?term=' + encodeURIComponent('tmdb:' + match.id),
+                headers: hdr,
+                timeout: 60000
+            });
+        } catch (e) {
+            throw errorDeMetadatos(e, 'Radarr', IDX.radarr);
+        }
         const base_ = Array.isArray(found) ? found[0] : found;
         if (!base_) throw new Error('Radarr no encuentra ese tmdbId');
 
@@ -750,9 +770,15 @@
             addOptions: { searchForMovie: !!CFG.radarrSearch }
         });
 
-        const created = await gmJSON({
-            method: 'POST', url: root + '/api/v3/movie', headers: hdr, body: JSON.stringify(body)
-        });
+        let created;
+        try {
+            created = await gmJSON({
+                method: 'POST', url: root + '/api/v3/movie', headers: hdr,
+                body: JSON.stringify(body), timeout: 60000
+            });
+        } catch (e) {
+            throw errorDeMetadatos(e, 'Radarr', IDX.radarr);
+        }
 
         // Refleja el alta en el índice para que el resto de chips de la página coincida.
         if (IDX.radarr && IDX.radarr.byTmdb) {
@@ -779,16 +805,23 @@
         if (match.title) terms.push(match.title);
 
         let base_ = null;
+        let ultimoFallo = null;
         for (const term of terms) {
             try {
                 const found = await gmJSON({
                     url: root + '/api/v3/series/lookup?term=' + encodeURIComponent(term),
-                    headers: hdr
+                    headers: hdr,
+                    timeout: 60000
                 });
                 if (Array.isArray(found) && found.length) { base_ = found[0]; break; }
-            } catch (e) { /* se prueba el siguiente término */ }
+            } catch (e) {
+                ultimoFallo = e;   // se prueba el siguiente término
+            }
         }
-        if (!base_) throw new Error('Sonarr no encuentra esa serie');
+        if (!base_) {
+            if (ultimoFallo) throw errorDeMetadatos(ultimoFallo, 'Sonarr', IDX.sonarr);
+            throw new Error('Sonarr no encuentra esa serie');
+        }
 
         const body = Object.assign({}, base_, {
             qualityProfileId: CFG.sonarrProfileId,
@@ -805,9 +838,15 @@
             body.languageProfileId = IDX.sonarr.languageProfileId;
         }
 
-        const created = await gmJSON({
-            method: 'POST', url: root + '/api/v3/series', headers: hdr, body: JSON.stringify(body)
-        });
+        let created;
+        try {
+            created = await gmJSON({
+                method: 'POST', url: root + '/api/v3/series', headers: hdr,
+                body: JSON.stringify(body), timeout: 60000
+            });
+        } catch (e) {
+            throw errorDeMetadatos(e, 'Sonarr', IDX.sonarr);
+        }
 
         if (IDX.sonarr) {
             const ref = { id: created.id, files: 0, total: 0, mon: 1, slug: created.titleSlug || '' };

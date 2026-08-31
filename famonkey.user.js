@@ -13,11 +13,7 @@
 // @grant        GM_deleteValue
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
-// @connect      api.themoviedb.org
-// @connect      image.tmdb.org
-// @connect      192.168.1.10
-// @connect      192.168.1.20
-// @connect      self
+// @connect      *
 // ==/UserScript==
 
 /* global GM_xmlhttpRequest, GM_getValue, GM_setValue, GM_deleteValue, GM_addStyle, GM_registerMenuCommand */
@@ -38,17 +34,17 @@
     const DEFAULTS = {
         tmdbKey: '',
 
-        plexUrl: 'http://192.168.1.10:32400',
+        plexUrl: '',
         plexToken: '',
 
-        radarrUrl: 'http://192.168.1.20:7878',
+        radarrUrl: '',
         radarrKey: '',
         radarrProfileId: null,
         radarrRoot: '',
         radarrMinAvail: 'released',
         radarrSearch: true,
 
-        sonarrUrl: 'http://192.168.1.20:8989',
+        sonarrUrl: '',
         sonarrKey: '',
         sonarrProfileId: null,
         sonarrRoot: '',
@@ -106,8 +102,51 @@
             .trim();
     }
 
+    // Tampermonkey tiene @connect * para que cada uno pueda apuntar a las
+    // direcciones de sus servicios sin editar la cabecera del script. El
+    // control de verdad se hace aquí: solo se sale hacia TMDB, hacia la propia
+    // web y hacia los servicios configurados, de modo que el token de Plex y
+    // las API keys no pueden acabar en un host ajeno.
+    function hostOf(url) {
+        try {
+            return new URL(String(url), location.href).hostname.toLowerCase();
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Hosts que el panel de ajustes está probando y que todavía no se han
+    // guardado en la configuración.
+    const EXTRA_HOSTS = [];
+    function allowHost(url) {
+        const h = hostOf(url);
+        if (h && EXTRA_HOSTS.indexOf(h) === -1) EXTRA_HOSTS.push(h);
+    }
+
+    function allowedHosts() {
+        const list = [location.hostname.toLowerCase(), 'api.themoviedb.org', 'image.tmdb.org'];
+        ['plexUrl', 'radarrUrl', 'sonarrUrl'].forEach(function (k) {
+            const h = hostOf(CFG[k]);
+            if (h) list.push(h);
+        });
+        return list.concat(EXTRA_HOSTS);
+    }
+
+    function isAllowedHost(host) {
+        if (!host) return false;
+        if (allowedHosts().indexOf(host) !== -1) return true;
+        // La propia web, con o sin www: la ficha se descarga del dominio base.
+        const partes = location.hostname.toLowerCase().split('.');
+        const dominio = partes.slice(-2).join('.');
+        return host === dominio || host.slice(-(dominio.length + 1)) === '.' + dominio;
+    }
+
     function gmFetch(opts) {
         return new Promise(function (resolve, reject) {
+            const destino = hostOf(opts.url);
+            if (!isAllowedHost(destino)) {
+                return reject(new Error('Destino no permitido: ' + (destino || opts.url)));
+            }
             GM_xmlhttpRequest({
                 method: opts.method || 'GET',
                 url: opts.url,
@@ -1374,6 +1413,7 @@
         $('testPlex').addEventListener('click', async function () {
             const st = $('stPlex');
             status(st, 'Conectando...');
+            allowHost($('plexUrl').value);
             try {
                 const secs = await gmJSON({
                     url: base($('plexUrl').value) + '/library/sections',
@@ -1392,6 +1432,7 @@
             const url = base($(kind + 'Url').value);
             const key = $(kind + 'Key').value;
             status(st, 'Conectando...');
+            allowHost(url);
             try {
                 const hdr = { 'X-Api-Key': key };
                 const profiles = await gmJSON({ url: url + '/api/v3/qualityprofile', headers: hdr });

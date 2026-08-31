@@ -21,6 +21,7 @@ Se guardan en el almacenamiento de Tampermonkey.
 
 | Dato | Dónde se obtiene |
 |---|---|
+| URLs de Plex, Radarr y Sonarr | Las de tu red, con puerto: `http://192.168.1.10:32400`, `http://192.168.1.20:7878`, `http://192.168.1.20:8989` |
 | API key de TMDB | themoviedb.org, ajustes de la cuenta, sección API. La v3, gratuita |
 | X-Plex-Token | En Plex Web, en cualquier elemento: menú ⋮, "Get Info", "View XML". El token va en la URL que se abre |
 | API key de Radarr | Radarr, Settings, General, API Key |
@@ -30,12 +31,17 @@ Después de pegar cada clave, pulsa **Probar conexión**. En Radarr y Sonarr eso
 además rellena los desplegables de perfil de calidad y carpeta raíz, que hay que
 elegir antes de poder enviar nada.
 
-Las URLs que trae el script son ejemplos (`192.168.1.10:32400` para Plex,
-`192.168.1.20:7878` y `:8989` para Radarr y Sonarr). Pon las tuyas en los
-ajustes y, además, **edita las líneas `@connect` de la cabecera del script** con
-tus direcciones: Tampermonkey solo deja al script hablar con los hosts que ahí
-figuran, y eso es justo lo que impide que tu token de Plex pueda acabar en otro
-sitio. Si no las cambias, el script no podrá conectar con tus servicios.
+No hace falta editar nada más. Las direcciones de tus servicios se ponen en el
+panel y el script las usa tal cual, con la IP y el puerto que sean.
+
+## Seguridad
+
+El script solo puede conectarse a TMDB, a la propia web y a las direcciones que
+tú hayas configurado. Esa comprobación está en el código, en el único punto por
+el que sale una petición, así que tu token de Plex y tus API keys no pueden
+acabar en un host ajeno aunque la cabecera declare `@connect *`. Esa declaración
+está para que cada uno pueda usar sus propias direcciones sin tocar el código;
+la restricción de verdad la impone el script.
 
 ## Qué significa cada distintivo
 

@@ -127,8 +127,12 @@ Al enviar algo, el chip pasa a ámbar de inmediato sin esperar al refresco del �
 
 ## 7. Seguridad
 
-- `@connect` limitado a los hosts configurados. Nunca `@connect *`: así el token de
-  Plex y las API keys no pueden acabar en un tercer host.
+- La cabecera declara `@connect *` para que cada usuario pueda apuntar a sus
+  propias direcciones sin editar el código, y la restricción se aplica en el
+  script: una comprobación en el único punto por el que sale una petición deja
+  pasar solo TMDB, la propia web y los servicios configurados. Así el token de
+  Plex y las API keys no pueden acabar en un tercer host, y además el filtro
+  sigue automáticamente a la configuración en vez de a una lista fija.
 - `GM_xmlhttpRequest` para todo, lo que evita CORS y el bloqueo de contenido mixto:
   un Radarr en `http://192.168.1.x:7878` funciona desde la página HTTPS de FilmAffinity.
 - Las claves se introducen en el panel de ajustes del script, no se escriben en el

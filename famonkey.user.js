@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.0.0
+// @version      1.1.0
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
+// @updateURL    https://raw.githubusercontent.com/ForeverRamone/famonkey/main/famonkey.user.js
+// @downloadURL  https://raw.githubusercontent.com/ForeverRamone/famonkey/main/famonkey.user.js
 // @run-at       document-idle
 // @noframes
 // @grant        GM_xmlhttpRequest

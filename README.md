@@ -7,12 +7,13 @@ botón para enviarla a Radarr o a Sonarr si no la tienes.
 ## Instalación
 
 1. Instala [Tampermonkey](https://www.tampermonkey.net/) en tu navegador.
-2. Abre el panel de Tampermonkey, elige "Crear un nuevo script", borra la
-   plantilla y pega el contenido de [`famonkey.user.js`](famonkey.user.js).
-   También puedes arrastrar el archivo a la ventana del navegador.
-3. Guarda con Ctrl+S.
-4. Abre el menú de Tampermonkey en cualquier página de FilmAffinity y elige
+2. Abre [este enlace](https://raw.githubusercontent.com/ForeverRamone/famonkey/main/famonkey.user.js): Tampermonkey
+   reconoce el archivo y ofrece instalarlo. Si prefieres hacerlo a mano, crea un
+   script nuevo y pega el contenido de [`famonkey.user.js`](famonkey.user.js).
+3. Abre el menú de Tampermonkey en cualquier página de FilmAffinity y elige
    **FA-Monkey: ajustes**.
+
+Instalado así, Tampermonkey avisa por su cuenta cuando hay una versión nueva.
 
 ## Configuración
 
@@ -22,7 +23,7 @@ Se guardan en el almacenamiento de Tampermonkey.
 | Dato | Dónde se obtiene |
 |---|---|
 | URLs de Plex, Radarr y Sonarr | Las de tu red, con puerto: `http://192.168.1.10:32400`, `http://192.168.1.20:7878`, `http://192.168.1.20:8989` |
-| API key de TMDB | themoviedb.org, ajustes de la cuenta, sección API. La v3, gratuita |
+| API key de TMDB | themoviedb.org, ajustes de la cuenta, sección API. La **API Key (v3 auth)**, no el "API Read Access Token" |
 | X-Plex-Token | En Plex Web, en cualquier elemento: menú ⋮, "Get Info", "View XML". El token va en la URL que se abre |
 | API key de Radarr | Radarr, Settings, General, API Key |
 | API key de Sonarr | Sonarr, Settings, General, API Key |

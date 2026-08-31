@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.4.0
+// @version      1.5.0
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
@@ -246,6 +246,11 @@
             .map(function (c) { return c.name; });
         CACHE_DIRECTORES.set(clave, nombres);
         return nombres;
+    }
+
+    async function tmdbPorId(kind, id) {
+        const data = await gmJSON({ url: tmdbUrl('/' + kind + '/' + id, { language: 'es-ES' }) });
+        return tmdbItem(kind, data);
     }
 
     async function tmdbTvdbId(tmdbId) {
@@ -525,7 +530,18 @@
             if (meta.pais && r.paises && r.paises.indexOf(meta.pais) !== -1) s += 3;
 
             s += Math.min(r.popularity, 40) / 40;   // desempate suave
-            return { item: r, score: s };
+
+            // ¿Coincide de verdad algún título, o solo se le parece? Sin una
+            // coincidencia exacta no se da nada por bueno: es lo que llevaba a
+            // emparejar "Genesis" con "Genesis: The Fall of Eden".
+            // Cuentan como exactas todas las formas legítimas del título: el
+            // literal sin recortar, el traducido, el original y el prefijo de
+            // las temporadas con nombre. Lo que no cuenta es parecerse.
+            const exacto = (nLiteral && (nt === nLiteral || no === nLiteral)) ||
+                           (nTitle && (nt === nTitle || no === nTitle)) ||
+                           (nOriginal && (no === nOriginal || nt === nOriginal)) ||
+                           (variantes.length && (variantes.indexOf(nt) !== -1 || variantes.indexOf(no) !== -1));
+            return { item: r, score: s, exacto: !!exacto };
         });
         list.sort(function (a, b) { return b.score - a.score; });
         return list;
@@ -534,6 +550,7 @@
     function isConfident(scored) {
         if (!scored.length) return false;
         if (scored[0].score < 5) return false;
+        if (!scored[0].exacto) return false;
         if (scored.length === 1) return true;
         return (scored[0].score - scored[1].score) >= 3;
     }
@@ -1064,6 +1081,8 @@
         '.fam-picker-body { padding:4px; }',
         '.fam-row { display:flex; gap:9px; padding:7px; border-radius:6px; cursor:pointer; align-items:center; }',
         '.fam-row:hover { background:#333; }',
+        '.fam-actual { background:#26331f; box-shadow: inset 3px 0 0 #8bc34a; }',
+        '.fam-actual .fam-s { color:#8bc34a; }',
         '.fam-row img { width:40px; height:60px; object-fit:cover; border-radius:3px; background:#333; flex:0 0 auto; }',
         '.fam-row .fam-t { font-weight:600; }',
         '.fam-row .fam-s { color:#aaa; font-size:12px; }',
@@ -1329,6 +1348,25 @@
                 chip._candidates = cands;
             } catch (e) { cands = []; }
         }
+        // La coincidencia en uso va siempre la primera y marcada, aunque la
+        // búsqueda por título no la devuelva. En una ficha el identificador lo
+        // publica la propia web, y entonces la lista de abajo no tiene por qué
+        // contenerla: sin esto parecía que el emparejamiento hubiera fallado.
+        if (chip._match) {
+            const presente = cands.some(function (c) {
+                return c.kind === chip._match.kind && c.id === chip._match.id;
+            });
+            if (!presente) {
+                let actual = null;
+                try {
+                    actual = await tmdbPorId(chip._match.kind, chip._match.id);
+                } catch (e) {
+                    actual = Object.assign({ poster: null, overview: '', original: '' }, chip._match);
+                }
+                cands = [actual].concat(cands);
+            }
+        }
+
         if (pickerEl !== box) return;
         renderPicker(box, chip, cands);
     }
@@ -1342,8 +1380,9 @@
         }
 
         cands.forEach(function (item) {
+            const esActual = chip._match && chip._match.kind === item.kind && chip._match.id === item.id;
             const row = document.createElement('div');
-            row.className = 'fam-row';
+            row.className = 'fam-row' + (esActual ? ' fam-actual' : '');
 
             const img = document.createElement('img');
             img.src = item.poster ? 'https://image.tmdb.org/t/p/w92' + item.poster : '';
@@ -1357,6 +1396,7 @@
             const s = document.createElement('div');
             s.className = 'fam-s';
             s.textContent = [
+                esActual ? 'en uso' : '',
                 item.kind === 'tv' ? 'serie' : 'pelicula',
                 item.year || 's/f',
                 item.original && item.original !== item.title ? item.original : ''

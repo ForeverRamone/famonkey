@@ -56,7 +56,11 @@ la restricción de verdad la impone el script.
 | Rojo, `!` | Error; el motivo está en el tooltip | Reintenta |
 
 **Mayús+clic** sobre cualquier distintivo abre el selector de candidatos, por si
-una coincidencia automática es incorrecta. La elección se guarda para siempre.
+una coincidencia automática es incorrecta. La que esté en uso aparece la primera
+y marcada en verde. La elección se guarda para siempre.
+
+Nunca se da por buena una coincidencia que solo se parezca: si ningún título
+cuadra exactamente, se pide elegir en lugar de arriesgar.
 
 ## Cómo funciona
 

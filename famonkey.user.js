@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.5.0
+// @version      1.5.1
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
@@ -1074,7 +1074,8 @@
         '.fam-unknown { background:#6b6b6b; }',
         '.fam-error { background:#a02020; }',
         '.fam-loading, .fam-busy { background:#4a4a4a; opacity:.75; cursor:default; }',
-        '.fam-picker { position:absolute; z-index:99999; width:340px; max-height:420px; overflow:auto;',
+        '.fam-picker { position:absolute; z-index:99999; width:340px; max-height:420px; overflow-y:auto;',
+        '  overscroll-behavior: contain;',
         '  background:#1e1e1e; color:#eee; border:1px solid #444; border-radius:8px;',
         '  font: 13px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; box-shadow:0 8px 28px rgba(0,0,0,.6); }',
         '.fam-picker-head { padding:9px 12px; font-weight:700; border-bottom:1px solid #383838; background:#262626; }',
@@ -1450,7 +1451,16 @@
         if (e.target.classList && e.target.classList.contains('fam-chip')) return;
         closePicker();
     }, true);
-    window.addEventListener('scroll', function () { if (pickerEl) closePicker(); }, true);
+    // El panel se cierra si se desplaza la página, pero no si lo que se
+    // desplaza es su propia lista: al escuchar en fase de captura, el scroll de
+    // dentro llegaba aquí y lo cerraba, de modo que no había forma de bajar a
+    // ver el resto de candidatos ni con la rueda ni con la barra.
+    window.addEventListener('scroll', function (e) {
+        if (!pickerEl) return;
+        const destino = e.target;
+        if (destino && destino.nodeType === 1 && pickerEl.contains(destino)) return;
+        closePicker();
+    }, true);
 
     /* ================================================================== *
      * 13. Avisos

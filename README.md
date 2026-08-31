@@ -78,6 +78,23 @@ Película o serie se decide por el marcador que FilmAffinity pone en el título:
 `(Serie de TV)` y `(Miniserie de TV)` van a Sonarr; el resto, incluidos los
 cortometrajes `(C)` y los telefilmes `(TV)`, a Radarr.
 
+### Películas que se llaman igual
+
+TMDB tiene más de veinte películas tituladas *Under the Skin*. Para no
+confundirlas, cada título se compara con el suyo: el original con el original y
+el traducido con el traducido. Que el título traducido de una candidata coincida
+con el original que busca uno es casualidad frecuente entre homónimas, así que
+cuenta poco.
+
+El año ayuda pero no manda, porque a veces el equivocado es el de TMDB: la
+*Under the Skin* de Jonathan Glazer, de 2013, figura allí como de 2020. Por eso
+la búsqueda no filtra por año de entrada, ya que filtrar dejaría fuera la
+película buena y le regalaría la partida a cualquier homónima que sí cuadre.
+
+Si aun así hay empate, decide la dirección: FilmAffinity la da en la ficha y
+TMDB en los créditos. Se consulta solo cuando hace falta y como mucho para tres
+candidatas.
+
 ### Series con una ficha por temporada
 
 FilmAffinity abre una ficha distinta para cada temporada: *Euphoria T3*, *Los

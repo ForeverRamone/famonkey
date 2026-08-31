@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.3.0
+// @version      1.4.0
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
@@ -233,6 +233,19 @@
         if (year) params[kind === 'movie' ? 'primary_release_year' : 'first_air_date_year'] = String(year);
         const data = await gmJSON({ url: tmdbUrl('/search/' + kind, params) });
         return (data.results || []).slice(0, 10).map(function (r) { return tmdbItem(kind, r); });
+    }
+
+    const CACHE_DIRECTORES = new Map();
+
+    async function tmdbDirectores(item) {
+        const clave = item.kind + ':' + item.id;
+        if (CACHE_DIRECTORES.has(clave)) return CACHE_DIRECTORES.get(clave);
+        const data = await gmJSON({ url: tmdbUrl('/' + item.kind + '/' + item.id + '/credits', {}) });
+        const nombres = (data.crew || [])
+            .filter(function (c) { return c.job === 'Director'; })
+            .map(function (c) { return c.name; });
+        CACHE_DIRECTORES.set(clave, nombres);
+        return nombres;
     }
 
     async function tmdbTvdbId(tmdbId) {
@@ -480,12 +493,22 @@
             const nt = norm(r.title);
             let s = 0;
 
-            if (nOriginal && (no === nOriginal || nt === nOriginal)) s += 6;
-            else if (nOriginal && no && (no.indexOf(nOriginal) === 0 || nOriginal.indexOf(no) === 0)) s += 2;
+            // Cada título se compara con el suyo: el original con el original y
+            // el traducido con el traducido. Que el título traducido de un
+            // candidato coincida con nuestro título original es casualidad
+            // habitual entre homónimas, así que cuenta poco.
+            if (nLiteral && (nt === nLiteral || no === nLiteral)) {
+                s += 6;
+            } else {
+                if (nOriginal && no === nOriginal) s += 6;
+                else if (nOriginal && no && (no.indexOf(nOriginal) === 0 || nOriginal.indexOf(no) === 0)) s += 2;
 
-            if (nLiteral && (nt === nLiteral || no === nLiteral)) s += 6;
-            else if (nTitle && (nt === nTitle || no === nTitle)) s += 5;
-            else if (variantes.length && (variantes.indexOf(nt) !== -1 || variantes.indexOf(no) !== -1)) s += 4;
+                if (nTitle && nt === nTitle) s += 5;
+                else if (variantes.length && (variantes.indexOf(nt) !== -1 || variantes.indexOf(no) !== -1)) s += 4;
+
+                if (nOriginal && no !== nOriginal && nt === nOriginal) s += 2;   // cruzado
+                if (nTitle && nt !== nTitle && no === nTitle) s += 2;            // cruzado
+            }
 
             if (e.hits > 1) s += 3;   // aparece en varias búsquedas distintas
 
@@ -493,7 +516,9 @@
                 const d = Math.abs(meta.year - r.year);
                 if (d === 0) s += 4;
                 else if (d === 1) s += 1;
-                else if (meta.type !== 'tv') s -= 4;   // en series el año es el de la temporada
+                // Se resta poco: el año de TMDB no siempre es de fiar. "Under the
+                // Skin" de Glazer, de 2013, figura allí como de 2020.
+                else if (meta.type !== 'tv') s -= 2;
             }
 
             // El país desempata series homónimas de distintos orígenes.
@@ -533,26 +558,68 @@
         const pool = seed || new Map();
         let scored = scoreCandidates(Array.from(pool.values()), meta);
 
+        async function consultar(kind, q, anio) {
+            const results = await tmdbSearch(kind, q, anio);
+            for (const r of results) {
+                const key = r.kind + ':' + r.id;
+                const prev = pool.get(key);
+                // Se cuenta en cuántos títulos DISTINTOS aparece cada candidato.
+                // Repetir la misma consulta filtrando por año no corrobora nada:
+                // es la misma búsqueda, y contarla dos veces premiaba a la
+                // película equivocada justo por cuadrar el año.
+                if (prev) {
+                    prev.terms.add(q);
+                    prev.hits = prev.terms.size;
+                } else {
+                    pool.set(key, { item: r, terms: new Set([q]), hits: 1 });
+                }
+            }
+            return scoreCandidates(Array.from(pool.values()), meta);
+        }
+
         for (const kind of kindsFor(meta.type)) {
             for (const q of queries) {
-                let results = await tmdbSearch(kind, q, meta.year);
-                if (!results.length && meta.year) results = await tmdbSearch(kind, q, null);
-
-                for (const r of results) {
-                    const key = r.kind + ':' + r.id;
-                    const prev = pool.get(key);
-                    if (prev) prev.hits++;
-                    else pool.set(key, { item: r, hits: 1 });
-                }
-
-                scored = scoreCandidates(Array.from(pool.values()), meta);
+                // Primero sin filtrar por año: filtrar deja fuera la película
+                // buena cuando TMDB la tiene mal fechada, y entonces gana por
+                // incomparecencia cualquier homónima que sí cuadre.
+                scored = await consultar(kind, q, null);
                 if (isConfident(scored)) {
                     return { match: scored[0].item, candidates: topItems(scored), pool: pool };
+                }
+                // Con el año se rescatan las que quedan sepultadas por
+                // popularidad más allá de los diez primeros resultados.
+                if (meta.year) {
+                    scored = await consultar(kind, q, meta.year);
+                    if (isConfident(scored)) {
+                        return { match: scored[0].item, candidates: topItems(scored), pool: pool };
+                    }
                 }
             }
         }
 
         return { match: null, candidates: topItems(scored), pool: pool };
+    }
+
+    // Cuando el título no basta, el director decide. Ocurre con las homónimas:
+    // "Under the Skin" son más de veinte películas en TMDB, y solo una la dirige
+    // Jonathan Glazer. Solo se consulta si hace falta, y como mucho tres veces.
+    async function desempatarPorDirector(candidatos, meta) {
+        if (!meta.director || !candidatos || candidatos.length < 2) return null;
+        const objetivo = norm(meta.director);
+        if (!objetivo) return null;
+
+        for (const item of candidatos.slice(0, 3)) {
+            if (item.kind !== 'movie') continue;   // en series FilmAffinity da el creador
+            let directores;
+            try {
+                directores = await tmdbDirectores(item);
+            } catch (e) {
+                continue;
+            }
+            const coincide = directores.some(function (d) { return norm(d) === objetivo; });
+            if (coincide) return item;
+        }
+        return null;
     }
 
     async function resolveMatch(metaCruda) {
@@ -589,6 +656,12 @@
                     out = await attemptMatch(full, pool);
                 }
             }
+        }
+
+        // Última carta: si el título deja empate, el director lo rompe.
+        if (!out.match && full.director) {
+            const elegido = await desempatarPorDirector(out.candidates || [], full);
+            if (elegido) out = { match: elegido, candidates: out.candidates, pool: out.pool };
         }
 
         if (out.match) {

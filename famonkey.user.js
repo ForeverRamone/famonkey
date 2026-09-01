@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.5.1
+// @version      1.6.0
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
@@ -54,7 +54,7 @@
         sonarrSearch: true,
 
         indexTtlHours: 6,
-        concurrency: 3
+        concurrency: 6
     };
 
     function readJSON(key, fallback) {
@@ -227,12 +227,34 @@
         };
     }
 
+    // Una misma consulta se repite mucho en una sola página: el póster y el
+    // título llevan a la misma película, y las temporadas de una serie comparten
+    // nombre. Se guarda la promesa, no el resultado, así dos búsquedas idénticas
+    // lanzadas a la vez viajan en una sola petición.
+    const CACHE_BUSQUEDA = new Map();
+
+    // Cada ficha puntúa y ordena sus candidatos por separado, así que se
+    // reparten copias en vez del mismo objeto.
+    function copiarItems(items) {
+        return items.map(function (o) { return Object.assign({}, o); });
+    }
+
     async function tmdbSearch(kind, query, year) {
         if (!query) return [];
+        const clave = kind + '|' + norm(query) + '|' + (year || '');
+        const guardada = CACHE_BUSQUEDA.get(clave);
+        if (guardada) return copiarItems(await guardada);
+
         const params = { query: query, language: 'es-ES', include_adult: 'false' };
         if (year) params[kind === 'movie' ? 'primary_release_year' : 'first_air_date_year'] = String(year);
-        const data = await gmJSON({ url: tmdbUrl('/search/' + kind, params) });
-        return (data.results || []).slice(0, 10).map(function (r) { return tmdbItem(kind, r); });
+        const pendiente = gmJSON({ url: tmdbUrl('/search/' + kind, params) })
+            .then(function (data) {
+                return (data.results || []).slice(0, 10).map(function (r) { return tmdbItem(kind, r); });
+            });
+        CACHE_BUSQUEDA.set(clave, pendiente);
+        // Un fallo no se queda guardado: la próxima vez se vuelve a intentar.
+        pendiente.catch(function () { CACHE_BUSQUEDA.delete(clave); });
+        return copiarItems(await pendiente);
     }
 
     const CACHE_DIRECTORES = new Map();
@@ -689,6 +711,26 @@
         return out;
     }
 
+    // La misma película sale varias veces en una página: el póster y el título
+    // son enlaces distintos, y cada uno monta su propio distintivo. Sin esto,
+    // los dos repetían por su cuenta la misma tanda de consultas a TMDB.
+    const RESOLVIENDO = new Map();
+
+    function resolveMatchUnaVez(meta) {
+        const clave = meta && meta.faId;
+        const arrancar = function () { return queue(function () { return resolveMatch(meta); }); };
+        if (!clave) return arrancar();
+
+        const enCurso = RESOLVIENDO.get(clave);
+        if (enCurso) return enCurso;
+
+        const tarea = arrancar();
+        RESOLVIENDO.set(clave, tarea);
+        const soltar = function () { RESOLVIENDO.delete(clave); };
+        tarea.then(soltar, soltar);
+        return tarea;
+    }
+
     function rememberChoice(faId, item) {
         if (item) store.map[faId] = { k: item.kind, i: item.id, t: item.title, y: item.year, m: 1 };
         else store.map[faId] = { none: 1 };
@@ -745,11 +787,16 @@
         const byTitle = {};
         let items = 0;
 
-        for (const d of dirs) {
-            const data = await gmJSON({
+        // Las bibliotecas se piden a la vez: son con diferencia la descarga más
+        // pesada del arranque, y encadenarlas sumaba una espera detrás de otra.
+        const bibliotecas = await Promise.all(dirs.map(function (d) {
+            return gmJSON({
                 url: root + '/library/sections/' + encodeURIComponent(d.key) + '/all?includeGuids=1',
                 headers: hdr
             });
+        }));
+
+        for (const data of bibliotecas) {
             const list = (data.MediaContainer || {}).Metadata || [];
             for (const it of list) {
                 const ref = { r: it.ratingKey, t: it.type };
@@ -838,23 +885,29 @@
             const fresh = entry && (Date.now() - entry.ts) < ttl;
             if (!force && fresh) {
                 IDX[name] = entry.data;
+                progServicio(name, 'listo');
                 continue;
             }
+            progServicio(name, 'cargando');
             jobs.push(
                 BUILDERS[name]()
                     .then(function (data) {
                         IDX[name] = data;
                         cached[name] = { ts: Date.now(), data: data };
+                        progServicio(name, 'listo');
                     })
                     .catch(function (err) {
                         IDX[name] = { error: err.message || String(err) };
                         if (entry) IDX[name] = Object.assign({}, entry.data, { stale: true });
+                        progServicio(name, 'error');
                     })
             );
         }
 
         await Promise.all(jobs);
-        writeJSON(IDX_KEY, cached);
+        // Guardar el índice entero cuesta un buen rato cuando la biblioteca es
+        // grande: solo se reescribe si de verdad se ha descargado algo.
+        if (jobs.length) writeJSON(IDX_KEY, cached);
         return IDX;
     }
 
@@ -1091,10 +1144,26 @@
         '.fam-picker-foot button { flex:1; padding:6px 8px; border-radius:5px; border:1px solid #555;',
         '  background:#333; color:#eee; cursor:pointer; font-size:12px; }',
         '.fam-picker-foot button:hover { background:#3d3d3d; }',
+        '.fam-prog { position:fixed; right:18px; bottom:18px; z-index:99990; width:246px;',
+        '  padding:10px 13px 12px; border-radius:8px; background:#1e1e1e; color:#eee;',
+        '  border:1px solid #444; box-shadow:0 8px 28px rgba(0,0,0,.6); cursor:pointer;',
+        '  font: 12px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;',
+        '  opacity:0; transform:translateY(10px); pointer-events:none;',
+        '  transition: opacity .2s ease, transform .2s ease; }',
+        '.fam-prog-on { opacity:1; transform:none; pointer-events:auto; }',
+        '.fam-prog-cab { font: 700 10px/1 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;',
+        '  letter-spacing:.09em; text-transform:uppercase; color:#e5a00d; margin-bottom:6px; }',
+        '.fam-prog-txt { margin-bottom:8px; color:#ddd; }',
+        '.fam-prog-rail { height:4px; border-radius:3px; background:#3a3a3a; overflow:hidden; }',
+        '.fam-prog-bar { height:100%; width:0; border-radius:3px; background:#e5a00d;',
+        '  transition: width .3s ease; }',
+        '.fam-prog-mal { border-color:#a02020; }',
+        '.fam-prog-mal .fam-prog-bar { background:#a02020; }',
         '.fam-toast { position:fixed; right:18px; bottom:18px; z-index:100000; max-width:380px;',
         '  padding:11px 14px; border-radius:8px; background:#1e1e1e; color:#eee; border:1px solid #444;',
         '  font: 13px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; box-shadow:0 8px 28px rgba(0,0,0,.6); }',
-        '.fam-toast.fam-bad { border-color:#a02020; }'
+        '.fam-toast.fam-bad { border-color:#a02020; }',
+        '.fam-toast.fam-alto { bottom:100px; }'
     ].join('\n');
 
     const STATES = {
@@ -1213,13 +1282,17 @@
 
     async function process(chip) {
         const meta = chip._meta;
+        progFicha();
         try {
             if (!CFG.tmdbKey) {
                 setChip(chip, 'error', 'Falta la API key de TMDB: menu de Tampermonkey, FA-Monkey ajustes');
                 return;
             }
-            await ensureIndexes(false);
-            const r = await queue(function () { return resolveMatch(meta); });
+            // Identificar el título en TMDB no necesita los índices de Plex,
+            // Radarr y Sonarr: lanzados a la vez, las dos esperas se solapan en
+            // vez de sumarse. El índice solo hace falta al pintar el estado.
+            const indices = ensureIndexes(false);
+            const r = await resolveMatchUnaVez(meta);
             chip._candidates = r.candidates || [];
             chip._meta = r.meta || meta;
             if (!r.match) {
@@ -1229,9 +1302,12 @@
                 return;
             }
             chip._match = r.match;
+            await indices;
             await applyStatus(chip);
         } catch (e) {
             setChip(chip, 'error', e.message || String(e));
+        } finally {
+            progFichaHecha();
         }
     }
 
@@ -1463,7 +1539,146 @@
     }, true);
 
     /* ================================================================== *
-     * 13. Avisos
+     * 13. Barra de progreso
+     *
+     * La primera carga descarga enteros los catálogos de Plex, Radarr y Sonarr
+     * y luego pregunta a TMDB por cada póster: puede irse a un minuto largo.
+     * Sin nada en pantalla parece que el script no funciona, así que cuenta en
+     * voz alta por dónde va. Solo asoma si de verdad tarda, y una vez que ha
+     * terminado no vuelve a aparecer mientras dure la página.
+     * ================================================================== */
+
+    const PROG_NOMBRES = { plex: 'Plex', radarr: 'Radarr', sonarr: 'Sonarr' };
+
+    const PROG = {
+        caja: null, texto: null, barra: null,
+        servicios: {},          // nombre -> 'cargando' | 'listo' | 'error'
+        fichas: 0,              // distintivos puestos en marcha
+        hechas: 0,              // distintivos ya resueltos
+        visible: false,
+        terminado: false,
+        verTimer: null,
+        ocultarTimer: null
+    };
+
+    function progCaja() {
+        if (PROG.caja) return PROG.caja;
+        const caja = document.createElement('div');
+        caja.className = 'fam-prog fam-ui';
+        caja.title = 'FA-Monkey esta trabajando. Clic para ocultar el aviso';
+        caja.innerHTML = '<div class="fam-prog-cab">FA-Monkey</div>' +
+                         '<div class="fam-prog-txt"></div>' +
+                         '<div class="fam-prog-rail"><div class="fam-prog-bar"></div></div>';
+        caja.addEventListener('click', progOcultar, true);
+        document.body.appendChild(caja);
+        PROG.caja  = caja;
+        PROG.texto = caja.querySelector('.fam-prog-txt');
+        PROG.barra = caja.querySelector('.fam-prog-bar');
+        return caja;
+    }
+
+    function progServiciosEn(estado) {
+        return Object.keys(PROG.servicios)
+            .filter(function (n) { return PROG.servicios[n] === estado; })
+            .map(function (n) { return PROG_NOMBRES[n]; });
+    }
+
+    function progUnir(nombres) {
+        if (nombres.length < 2) return nombres[0] || '';
+        return nombres.slice(0, -1).join(', ') + ' y ' + nombres[nombres.length - 1];
+    }
+
+    function progPendiente() {
+        return progServiciosEn('cargando').length > 0 || PROG.hechas < PROG.fichas;
+    }
+
+    function progTexto() {
+        const cargando = progServiciosEn('cargando');
+        if (cargando.length) return 'Leyendo lo que ya tienes en ' + progUnir(cargando) + '...';
+        if (PROG.hechas < PROG.fichas) {
+            return 'Identificando titulos: ' + PROG.hechas + ' de ' + PROG.fichas;
+        }
+        const fallos = progServiciosEn('error');
+        if (fallos.length) return 'Sin respuesta de ' + progUnir(fallos);
+        return 'Listo';
+    }
+
+    function progPintar() {
+        const caja = progCaja();
+        const servicios = Object.keys(PROG.servicios);
+        const total  = servicios.length + PROG.fichas;
+        const hechas = servicios.filter(function (n) { return PROG.servicios[n] !== 'cargando'; }).length +
+                       Math.min(PROG.hechas, PROG.fichas);
+        PROG.barra.style.width = (total ? Math.round(hechas * 100 / total) : 0) + '%';
+        PROG.texto.textContent = progTexto();
+        caja.classList.toggle('fam-prog-mal', progServiciosEn('error').length > 0);
+        return caja;
+    }
+
+    function progMostrar() {
+        PROG.verTimer = null;
+        PROG.visible = true;
+        const caja = progPintar();
+        // El navegador necesita medir la caja antes de animarla. Se le fuerza a
+        // hacerlo aquí mismo: con requestAnimationFrame, una pestaña que no está
+        // pintando puede tardar en devolver el turno y la barra se queda invisible.
+        void caja.offsetWidth;
+        caja.classList.add('fam-prog-on');
+    }
+
+    function progOcultar() {
+        clearTimeout(PROG.ocultarTimer);
+        PROG.ocultarTimer = null;
+        PROG.visible = false;
+        PROG.terminado = true;
+        const caja = PROG.caja;
+        PROG.caja = null;
+        if (!caja) return;
+        caja.classList.remove('fam-prog-on');
+        setTimeout(function () { if (caja.parentNode) caja.parentNode.removeChild(caja); }, 400);
+    }
+
+    function progRender() {
+        if (PROG.terminado || !document.body) return;
+
+        if (progPendiente()) {
+            clearTimeout(PROG.ocultarTimer);
+            PROG.ocultarTimer = null;
+            // Medio segundo de cortesía: si estaba todo en caché no llega a verse.
+            if (!PROG.visible) {
+                if (!PROG.verTimer) PROG.verTimer = setTimeout(progMostrar, 500);
+                return;
+            }
+            progPintar();
+            return;
+        }
+
+        clearTimeout(PROG.verTimer);
+        PROG.verTimer = null;
+        if (!PROG.visible) return;      // nunca llegó a asomar: no hay nada que cerrar
+        progPintar();
+        if (!PROG.ocultarTimer) {
+            const fallos = progServiciosEn('error').length > 0;
+            PROG.ocultarTimer = setTimeout(progOcultar, fallos ? 7000 : 1600);
+        }
+    }
+
+    function progServicio(nombre, estado) {
+        PROG.servicios[nombre] = estado;
+        progRender();
+    }
+
+    function progFicha()      { PROG.fichas++; progRender(); }
+    function progFichaHecha() { PROG.hechas++; progRender(); }
+
+    // Al refrescar los indices a mano vuelve a tener algo que contar.
+    function progReiniciar() {
+        PROG.terminado = false;
+        PROG.servicios = {};
+    }
+
+    /* ================================================================== *
+     * 13 bis. Avisos
      * ================================================================== */
 
     let toastTimer = null;
@@ -1474,7 +1689,7 @@
             el.id = 'fam-toast';
             document.body.appendChild(el);
         }
-        el.className = 'fam-toast fam-ui' + (bad ? ' fam-bad' : '');
+        el.className = 'fam-toast fam-ui' + (bad ? ' fam-bad' : '') + (PROG.visible ? ' fam-alto' : '');
         el.textContent = msg;
         clearTimeout(toastTimer);
         toastTimer = setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, ms || 4500);
@@ -1604,7 +1819,7 @@
                   <label for="indexTtlHours">Caducidad del indice (h)</label>
                   <input type="number" id="indexTtlHours" min="1" max="168">
                   <label for="concurrency">Peticiones en paralelo</label>
-                  <input type="number" id="concurrency" min="1" max="8">
+                  <input type="number" id="concurrency" min="1" max="12">
                 </div>
                 <p class="note" id="idxInfo"></p>
               </fieldset>
@@ -1732,7 +1947,7 @@
             CFG.radarrSearch = $('radarrSearch').checked;
             CFG.sonarrSearch = $('sonarrSearch').checked;
             CFG.indexTtlHours = parseInt($('indexTtlHours').value, 10) || 6;
-            CFG.concurrency = parseInt($('concurrency').value, 10) || 3;
+            CFG.concurrency = parseInt($('concurrency').value, 10) || 6;
             writeJSON(CFG_KEY, CFG);
             close();
             toast('Ajustes guardados. Recargando indices...');
@@ -1772,6 +1987,7 @@
 
         GM_registerMenuCommand('FA-Monkey: ajustes', openSettings);
         GM_registerMenuCommand('FA-Monkey: refrescar indices', function () {
+            progReiniciar();
             toast('Recargando indices...');
             ensureIndexes(true).then(function () {
                 refreshMatching(function () { return true; });

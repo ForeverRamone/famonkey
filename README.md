@@ -82,6 +82,22 @@ Película o serie se decide por el marcador que FilmAffinity pone en el título:
 `(Serie de TV)` y `(Miniserie de TV)` van a Sonarr; el resto, incluidos los
 cortometrajes `(C)` y los telefilmes `(TV)`, a Radarr.
 
+### La primera carga
+
+La primera vez tarda, y ese rato tiene explicación: hay que descargar enteros
+los catálogos de Plex, Radarr y Sonarr —varios megabytes si la biblioteca es
+grande— y encima preguntar a TMDB por cada póster de la página. Mientras eso
+pasa, abajo a la derecha aparece una barrita que va diciendo por dónde va:
+primero qué servicio está leyendo y luego cuántos títulos lleva identificados.
+Se cierra sola al acabar, no vuelve a salir en el resto de la página, y si
+molesta se quita con un clic.
+
+Las dos esperas corren a la vez en lugar de una detrás de otra, las bibliotecas
+de Plex se piden en paralelo y las consultas repetidas de una misma página se
+agrupan en una sola: un póster y su título son dos enlaces distintos, pero
+preguntan lo mismo. De la segunda visita en adelante casi todo sale de la caché
+y la barra ni llega a asomar.
+
 ### Películas que se llaman igual
 
 TMDB tiene más de veinte películas tituladas *Under the Skin*. Para no

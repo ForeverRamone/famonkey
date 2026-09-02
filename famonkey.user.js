@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.7.0
+// @version      1.8.0
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
@@ -31,6 +31,7 @@
     const MAP_KEY  = 'famonkey.map';    // faId  -> coincidencia TMDB
     const META_KEY = 'famonkey.meta';   // faId  -> datos leídos de la ficha
     const TVDB_KEY = 'famonkey.tvdb';   // tmdb  -> tvdb (solo series)
+    const IMDB_KEY = 'famonkey.imdb';   // tmdb  -> imdb (bibliotecas con agente antiguo)
     const IDX_KEY  = 'famonkey.index';  // índices de Plex / Radarr / Sonarr
 
     // Sube cuando cambia la forma de las claves del índice. Lo guardado con una
@@ -75,30 +76,63 @@
         GM_setValue(key, JSON.stringify(value));
     }
 
-    let CFG = Object.assign({}, DEFAULTS, readJSON(CFG_KEY, {}));
+    // Igual que readJSON, pero exigiendo un objeto llano. Un null, un array o
+    // un número colados en el almacén reventaban el arranque —y el script
+    // parecía desinstalado— o hacían crecer el fichero sin sentido.
+    function readMap(key) {
+        const v = readJSON(key, null);
+        return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
+    }
+
+    let CFG = Object.assign({}, DEFAULTS, readMap(CFG_KEY));
 
     const store = {
-        map:  readJSON(MAP_KEY,  {}),
-        meta: readJSON(META_KEY, {}),
-        tvdb: readJSON(TVDB_KEY, {})
+        map:  readMap(MAP_KEY),
+        meta: readMap(META_KEY),
+        tvdb: readMap(TVDB_KEY),
+        imdb: readMap(IMDB_KEY)
     };
 
     let flushTimer = null;
+
+    function flushYa() {
+        clearTimeout(flushTimer);
+        flushTimer = null;
+        writeJSON(MAP_KEY,  store.map);
+        writeJSON(META_KEY, store.meta);
+        writeJSON(TVDB_KEY, store.tvdb);
+        writeJSON(IMDB_KEY, store.imdb);
+    }
+
     function flushSoon() {
         clearTimeout(flushTimer);
-        flushTimer = setTimeout(function () {
-            writeJSON(MAP_KEY,  store.map);
-            writeJSON(META_KEY, store.meta);
-            writeJSON(TVDB_KEY, store.tvdb);
-        }, 1500);
+        flushTimer = setTimeout(flushYa, 1500);
     }
+
+    // El respiro de flushSoon se reprograma con cada dato nuevo, así que
+    // cerrar la pestaña mientras la página seguía resolviendo tiraba todo lo
+    // aprendido y había que volver a preguntarlo entero.
+    window.addEventListener('pagehide', flushYa);
+    document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState === 'hidden') flushYa();
+    });
 
     /* ================================================================== *
      * 2. Utilidades
      * ================================================================== */
 
+    // Las direcciones de los servicios son absolutas. Escritas sin esquema
+    // —"192.168.1.10:32400", "plex.local", "/plex"—, new URL() las resolvía
+    // contra la página: el destino acababa siendo la propia web, que está
+    // permitida, y el token de Plex y las API keys salían hacia ella en la
+    // cabecera. Con el esquema puesto, el destino vuelve a ser el que el
+    // usuario quería decir; y una ruta sin host se queda sin resolver en vez
+    // de desviarse.
     function base(url) {
-        return String(url || '').trim().replace(/\/+$/, '');
+        const limpio = String(url || '').trim().replace(/\/+$/, '');
+        if (!limpio) return '';
+        if (/^[a-z][a-z0-9+.-]*:\/\//i.test(limpio)) return limpio;
+        return 'http://' + limpio.replace(/^\/+/, '');
     }
 
     function norm(s) {
@@ -126,14 +160,14 @@
     // guardado en la configuración.
     const EXTRA_HOSTS = [];
     function allowHost(url) {
-        const h = hostOf(url);
+        const h = hostOf(base(url));
         if (h && EXTRA_HOSTS.indexOf(h) === -1) EXTRA_HOSTS.push(h);
     }
 
     function allowedHosts() {
         const list = [location.hostname.toLowerCase(), 'api.themoviedb.org', 'image.tmdb.org'];
         ['plexUrl', 'radarrUrl', 'sonarrUrl'].forEach(function (k) {
-            const h = hostOf(CFG[k]);
+            const h = hostOf(base(CFG[k]));
             if (h) list.push(h);
         });
         return list.concat(EXTRA_HOSTS);
@@ -150,6 +184,11 @@
 
     function gmFetch(opts) {
         return new Promise(function (resolve, reject) {
+            // Segunda barrera: sólo se sale a direcciones absolutas. Una
+            // relativa se resolvería contra la propia web, que está permitida.
+            if (!/^https?:\/\//i.test(String(opts.url || ''))) {
+                return reject(new Error('Direccion no absoluta: ' + opts.url));
+            }
             const destino = hostOf(opts.url);
             if (!isAllowedHost(destino)) {
                 return reject(new Error('Destino no permitido: ' + (destino || opts.url)));
@@ -204,7 +243,15 @@
         };
     }
 
-    const queue = makeQueue(CFG.concurrency || 3);
+    // Un valor negativo dejaba la cola sin arrancar ni una tarea —active >= limit
+    // es cierto de entrada— y los distintivos se quedaban girando para siempre,
+    // sin aviso; uno no numérico la dejaba sin límite ninguno.
+    function limiteCola(n) {
+        const v = parseInt(n, 10);
+        return (isFinite(v) && v >= 1) ? Math.min(v, 12) : 6;
+    }
+
+    const queue = makeQueue(limiteCola(CFG.concurrency));
 
     /* ================================================================== *
      * 3. TMDB
@@ -280,6 +327,17 @@
         return tmdbItem(kind, data);
     }
 
+    // Sólo se pregunta cuando la biblioteca de Plex tiene fichas indexadas por
+    // imdb —agentes antiguos— y el título no ha aparecido por tmdb ni por tvdb.
+    async function tmdbImdbId(kind, tmdbId) {
+        const clave = kind + ':' + tmdbId;
+        if (Object.prototype.hasOwnProperty.call(store.imdb, clave)) return store.imdb[clave];
+        const data = await gmJSON({ url: tmdbUrl('/' + kind + '/' + tmdbId + '/external_ids', {}) });
+        store.imdb[clave] = data.imdb_id || null;
+        flushSoon();
+        return store.imdb[clave];
+    }
+
     async function tmdbTvdbId(tmdbId) {
         if (Object.prototype.hasOwnProperty.call(store.tvdb, tmdbId)) return store.tvdb[tmdbId];
         const data = await gmJSON({ url: tmdbUrl('/tv/' + tmdbId + '/external_ids', {}) });
@@ -296,7 +354,10 @@
     const APOS = "'";
 
     function idFromHref(href) {
-        const m = RE_FILM_ID.exec(String(href || ''));
+        // Sólo la ruta: los botones de compartir llevan la ficha dentro de la
+        // query (?u=...film123.html) y recibían distintivo como si fueran ella.
+        const ruta = String(href || '').split(/[?#]/)[0];
+        const m = RE_FILM_ID.exec(ruta);
         return m ? m[1] : null;
     }
 
@@ -316,7 +377,10 @@
 
     function cleanTitle(text) {
         return String(text || '')
-            .replace(/\((?:serie de tv|miniserie de tv|tv series|tv miniseries|tv|c|s)\)/gi, '')
+            .replace(/\((?:serie de tv|miniserie de tv|tv series|tv miniseries)\)/gi, '')
+            // Los de una o dos letras van al final. Sin anclarlos, "Cuando ella
+            // (C) baila" perdía el paréntesis de en medio.
+            .replace(/\s*\((?:tv|c|s)\)\s*$/i, '')
             .replace(/\s+/g, ' ')
             .trim();
     }
@@ -357,12 +421,19 @@
 
     function quitarTemporada(titulo) {
         const t = String(titulo || '').replace(/\s+/g, ' ').trim();
-        for (const re of RE_TEMPORADA) {
-            const m = re.exec(t);
-            if (m) {
-                const base = t.slice(0, m.index).trim();
-                if (base) return { titulo: base, temporada: parseInt(m[1], 10) };
-            }
+        for (let i = 0; i < RE_TEMPORADA.length; i++) {
+            const m = RE_TEMPORADA[i].exec(t);
+            if (!m) continue;
+            const base = t.slice(0, m.index).trim();
+            if (!base) continue;
+            const numero = parseInt(m[1], 10);
+            // El número desnudo, sin T ni S ni "temporada" delante, es la regla
+            // que más se equivoca: "Los 80", "Studio 60" y "Apartamento 23" son
+            // nombres, no temporadas. Con marcador explícito se acepta cualquier
+            // número; sin él, sólo un recuento de temporadas creíble.
+            const desnudo = (i === RE_TEMPORADA.length - 1);
+            if (desnudo && numero > 20) continue;
+            return { titulo: base, temporada: numero };
         }
         return { titulo: t, temporada: null };
     }
@@ -451,7 +522,9 @@
         return {
             faId: faId,
             raw: ogText || pickText(nameEl),
-            title: pickText(nameEl) || cleanTitle(ogText),
+            // og:title acaba en "(1989)": de reserva sirve, pero ese paréntesis
+            // viajaba a TMDB como parte del título y no encontraba nada.
+            title: pickText(nameEl) || cleanTitle(ogText).replace(/\s*\(\d{4}\)\s*$/, ''),
             original: original || '',
             type: type,
             year: year,
@@ -474,6 +547,20 @@
     /* ================================================================== *
      * 5. Resolución FilmAffinity -> TMDB
      * ================================================================== */
+
+    // Los datos de la ficha mandan sobre los de la tarjeta, pero sólo cuando
+    // dicen algo. Con Object.assign a secas, un título vacío o un año nulo
+    // leídos de una ficha a medias borraban los buenos, y la película se
+    // quedaba en "sin coincidencia" para siempre y en todas las páginas.
+    function mezclarMeta(base_, extra) {
+        const out = Object.assign({}, base_);
+        Object.keys(extra || {}).forEach(function (k) {
+            const v = extra[k];
+            if (v === null || v === undefined || v === '') return;
+            out[k] = v;
+        });
+        return out;
+    }
 
     function kindsFor(type) {
         if (type === 'tv') return ['tv'];
@@ -574,12 +661,30 @@
         return list;
     }
 
-    function isConfident(scored) {
+    function isConfident(scored, meta) {
         if (!scored.length) return false;
-        if (scored[0].score < 5) return false;
-        if (!scored[0].exacto) return false;
+        const mejor = scored[0];
+        if (mejor.score < 5) return false;
+        if (!mejor.exacto) return false;
+        // Un candidato único se daba por bueno sin mirar el año: un cortometraje
+        // de 1993 que TMDB no tiene se emparejaba con el largo homónimo de 2018
+        // y salía marcado como presente. Más vale preguntar que acertar de menos.
+        const anio = meta && meta.year;
+        if (anio && mejor.item.year && Math.abs(mejor.item.year - anio) > 2) return false;
         if (scored.length === 1) return true;
-        return (scored[0].score - scored[1].score) >= 3;
+        return (mejor.score - scored[1].score) >= 3;
+    }
+
+    // Fichas de TMDB que se llaman exactamente igual que la que se busca. Con
+    // más de una, el título deja de decidir y hace falta la dirección.
+    function homonimasDe(candidatos, meta) {
+        const porTitulo = norm(meta && meta.title);
+        const porOriginal = norm(meta && meta.original);
+        return (candidatos || []).filter(function (c) {
+            const nt = norm(c.title), no = norm(c.original);
+            return (porTitulo && (nt === porTitulo || no === porTitulo)) ||
+                   (porOriginal && (nt === porOriginal || no === porOriginal));
+        });
     }
 
     function topItems(scored) {
@@ -627,14 +732,14 @@
                 // buena cuando TMDB la tiene mal fechada, y entonces gana por
                 // incomparecencia cualquier homónima que sí cuadre.
                 scored = await consultar(kind, q, null);
-                if (isConfident(scored)) {
+                if (isConfident(scored, meta)) {
                     return { match: scored[0].item, candidates: topItems(scored), pool: pool };
                 }
                 // Con el año se rescatan las que quedan sepultadas por
                 // popularidad más allá de los diez primeros resultados.
                 if (meta.year) {
                     scored = await consultar(kind, q, meta.year);
-                    if (isConfident(scored)) {
+                    if (isConfident(scored, meta)) {
                         return { match: scored[0].item, candidates: topItems(scored), pool: pool };
                     }
                 }
@@ -646,13 +751,13 @@
 
     // Cuando el título no basta, el director decide. Ocurre con las homónimas:
     // "Under the Skin" son más de veinte películas en TMDB, y solo una la dirige
-    // Jonathan Glazer. Solo se consulta si hace falta, y como mucho tres veces.
+    // Jonathan Glazer. Solo se consulta si hace falta, y como mucho cinco veces.
     async function desempatarPorDirector(candidatos, meta) {
         if (!meta.director || !candidatos || candidatos.length < 2) return null;
         const objetivo = norm(meta.director);
         if (!objetivo) return null;
 
-        for (const item of candidatos.slice(0, 3)) {
+        for (const item of candidatos.slice(0, 5)) {
             if (item.kind !== 'movie') continue;   // en series FilmAffinity da el creador
             let directores;
             try {
@@ -670,31 +775,37 @@
         // Se normaliza siempre lo último que se sepa del título: los datos de la
         // ficha pisan a los de la tarjeta y volverían a traer el "T3" y el año
         // de la temporada si se normalizara antes de mezclarlos.
-        const meta = normalizarSerie(metaCruda);
+        // Se mezcla siempre lo que se sepa de la ficha, también en la rama
+        // cacheada: si no, de la segunda carga en adelante se perdía la
+        // temporada que sólo constaba ahí.
+        let full = normalizarSerie(mezclarMeta(metaCruda, store.meta[metaCruda.faId]));
+
         const cached = store.map[metaCruda.faId];
         if (cached) {
-            if (cached.none) return { match: null, candidates: [], ignored: true, meta: meta };
+            if (cached.none) return { match: null, candidates: [], ignored: true, meta: full };
             return {
-                match: { kind: cached.k, id: cached.i, title: cached.t || meta.title, year: cached.y || meta.year },
+                match: { kind: cached.k, id: cached.i, title: cached.t || full.title, year: cached.y || full.year },
                 cached: true,
-                meta: meta
+                meta: full
             };
         }
 
-        let full = normalizarSerie(Object.assign({}, metaCruda, store.meta[metaCruda.faId] || {}));
         let out = await attemptMatch(full);
 
-        // Sin coincidencia clara: la ficha aporta título original, año y dirección.
-        if (!out.match && !store.meta[metaCruda.faId]) {
+        // Sin coincidencia clara —o con varias candidatas que se llaman
+        // exactamente igual—, la ficha aporta título original, año y dirección.
+        // Antes sólo se pedía cuando no había ninguna, así que con homónimas la
+        // equivocada ganaba y la dirección no se llegaba a mirar nunca.
+        if ((!out.match || homonimasDe(out.candidates, full).length > 1) && !store.meta[metaCruda.faId]) {
             const extra = await fetchFicha(metaCruda.faId);
             if (extra) {
                 store.meta[metaCruda.faId] = extra;
                 flushSoon();
-                full = normalizarSerie(Object.assign({}, metaCruda, extra));
+                full = normalizarSerie(mezclarMeta(metaCruda, extra));
 
                 const pool = out.pool || new Map();
                 const rescored = scoreCandidates(Array.from(pool.values()), full);
-                if (isConfident(rescored)) {
+                if (isConfident(rescored, full)) {
                     out = { match: rescored[0].item, candidates: topItems(rescored), pool: pool };
                 } else {
                     out = await attemptMatch(full, pool);
@@ -702,10 +813,32 @@
             }
         }
 
-        // Última carta: si el título deja empate, el director lo rompe.
-        if (!out.match && full.director) {
-            const elegido = await desempatarPorDirector(out.candidates || [], full);
-            if (elegido) out = { match: elegido, candidates: out.candidates, pool: out.pool };
+        // Última carta: si el título deja empate, el director lo rompe. Antes
+        // esto sólo corría sin coincidencia ninguna, de modo que una equivocada
+        // pero "segura" ganaba sin preguntar —justo el caso para el que está—.
+        if (full.director) {
+            const homonimas = homonimasDe(out.candidates, full);
+            const dudosas = homonimas.length > 1 ? homonimas
+                          : (out.match ? [] : (out.candidates || []));
+            if (dudosas.length > 1) {
+                const elegido = await desempatarPorDirector(dudosas, full);
+                if (elegido) out = { match: elegido, candidates: out.candidates, pool: out.pool };
+            }
+        }
+
+        // "Babylon 5", "Warehouse 13", "Studio 60": el número final es parte del
+        // nombre, no una temporada. Si la ficha que gana se llama exactamente
+        // como el título sin recortar, no había tal temporada, y el año que se
+        // había apartado por serlo vuelve a valer.
+        if (out.match && full.season && full.literal) {
+            const literal = norm(full.literal);
+            if (literal && (norm(out.match.title) === literal || norm(out.match.original) === literal)) {
+                full = Object.assign({}, full, {
+                    season: null,
+                    title: full.literal,
+                    year: full.year || metaCruda.year || null
+                });
+            }
         }
 
         if (out.match) {
@@ -791,6 +924,7 @@
         const guid = {};
         const byTitle = {};
         let items = 0;
+        let conImdb = 0;
 
         // Las bibliotecas se piden a la vez: son con diferencia la descarga más
         // pesada del arranque, y encadenarlas sumaba una espera detrás de otra.
@@ -811,14 +945,17 @@
                 // y Parks and Recreation entre las series.
                 const medio = it.type === 'show' ? 'tv' : 'movie';
                 const ref = { r: it.ratingKey, t: it.type };
-                for (const g of guidsOf(it)) guid[medio + '|' + g] = ref;
+                for (const g of guidsOf(it)) {
+                    guid[medio + '|' + g] = ref;
+                    if (g.indexOf('imdb:') === 0) conImdb++;
+                }
                 const key = medio + '|' + norm(it.title) + '|' + (it.year || '');
                 if (!byTitle[key]) byTitle[key] = ref;
                 items++;
             }
         }
 
-        return { machine: machine, guid: guid, byTitle: byTitle, count: items };
+        return { machine: machine, guid: guid, byTitle: byTitle, count: items, imdb: conImdb };
     }
 
     async function buildRadarrIndex() {
@@ -886,8 +1023,11 @@
     let indexesReady = null;
 
     async function loadIndexes(force) {
-        const cached = readJSON(IDX_KEY, {});
-        const ttl = Math.max(1, CFG.indexTtlHours || 6) * 3600 * 1000;
+        const cached = readMap(IDX_KEY);
+        // Un valor no numérico daba NaN, y con NaN ningún índice era fresco:
+        // se volvía a descargar todo en cada carga.
+        const horas = parseInt(CFG.indexTtlHours, 10);
+        const ttl = Math.max(1, isFinite(horas) ? horas : 6) * 3600 * 1000;
         const jobs = [];
 
         for (const name of ['plex', 'radarr', 'sonarr']) {
@@ -955,6 +1095,17 @@
             arr = ((IDX.radarr || {}).byTmdb || {})[match.id] || null;
         }
 
+        // Las bibliotecas con agente antiguo indexan el cine por imdb, y esas
+        // claves se guardaban pero no se consultaban nunca: una película que
+        // estaba en Plex se declaraba ausente en cuanto el año de Plex no
+        // coincidiera con el de TMDB. Se pregunta el imdb sólo si el índice
+        // tiene alguna clave de esas, para no gastar una petición de más.
+        if (!hit && plex && plex.imdb) {
+            let imdb = null;
+            try { imdb = await tmdbImdbId(match.kind, match.id); } catch (e) { imdb = null; }
+            if (imdb) hit = plex.guid[medio + '|imdb:' + imdb] || null;
+        }
+
         // Último recurso: coincidencia por título normalizado y año.
         if (!hit && plex && match.title && match.year) {
             hit = plex.byTitle[medio + '|' + norm(match.title) + '|' + match.year] || null;
@@ -974,8 +1125,13 @@
         // tiene la serie, se mira esa temporada en concreto: tener la serie no
         // significa tener justo la temporada que estás mirando.
         if (temporada && arr && arr.temporadas && (estado.state === 'plex' || estado.state === 'downloaded')) {
+            const conocidas = Object.keys(arr.temporadas);
             const t = arr.temporadas[temporada];
-            if (t && t.files === 0) {
+            // Sin archivos, o directamente sin esa temporada: mirando la ficha de
+            // la T10 de una serie de la que Sonarr solo sabe hasta la T3, decir
+            // "descargada" es mentira. Si Sonarr no sabe de ninguna temporada
+            // (serie recien anadida) no hay nada que afirmar y se deja como esta.
+            if (conocidas.length && (!t || t.files === 0)) {
                 estado = { state: 'queued', arr: arr, tvdb: tvdb, temporadaVacia: temporada };
             }
         }
@@ -991,17 +1147,49 @@
     // (api.radarr.video, skyhook.sonarr.tv). Si esos están inalcanzables, la
     // petición se queda colgada aunque el servicio local responda de sobra, y
     // el error por defecto haría pensar que el problema es la red de casa.
-    function errorDeMetadatos(err, servicio, indice) {
-        const colgada = /tiempo de espera/i.test(err && err.message ? err.message : '');
-        const localResponde = indice && !indice.error;
-        if (colgada && localResponde) {
-            return new Error(servicio + ' responde, pero no alcanza su servidor de metadatos. ' +
-                             'Suele ser un bloqueo de IPs de Cloudflare: mira el README.');
+    // Que el índice no tuviera error no prueba nada: uno leído de la caché, o
+    // marcado como viejo, tampoco lo tiene. Con Radarr apagado del todo, el
+    // mensaje mandaba a buscar un bloqueo de Cloudflare que no existía. Así que
+    // se pregunta al servicio en ese momento, y sólo si contesta se le atribuye
+    // el problema a su servidor de metadatos.
+    async function respondeElServicio(servicio) {
+        const raiz = servicio === 'Radarr' ? base(CFG.radarrUrl) : base(CFG.sonarrUrl);
+        const key  = servicio === 'Radarr' ? CFG.radarrKey : CFG.sonarrKey;
+        if (!raiz || !key) return false;
+        try {
+            await gmJSON({ url: raiz + '/api/v3/system/status', headers: { 'X-Api-Key': key }, timeout: 8000 });
+            return true;
+        } catch (e) {
+            return false;
         }
-        return err;
+    }
+
+    async function errorDeMetadatos(err, servicio) {
+        const colgada = /tiempo de espera/i.test(err && err.message ? err.message : '');
+        if (!colgada) return err;
+        if (!(await respondeElServicio(servicio))) return err;
+        return new Error(servicio + ' responde, pero no alcanza su servidor de metadatos. ' +
+                         'Suele ser un bloqueo de IPs de Cloudflare: mira el README.');
+    }
+
+    // El lookup devuelve la ficha entera del servicio, con campos que sólo
+    // tienen sentido para algo ya añadido. Devolverlos en el alta manda una
+    // ruta que contradice la carpeta raíz elegida, y etiquetas que igual no
+    // existen. Se quitan antes de enviar.
+    const SOBRAN_DEL_LOOKUP = [
+        'id', 'path', 'folderName', 'movieFile', 'hasFile', 'added',
+        'sizeOnDisk', 'statistics', 'episodeFileCount', 'rootFolderPath'
+    ];
+
+    function limpiarDelLookup(ficha) {
+        const body = Object.assign({}, ficha);
+        SOBRAN_DEL_LOOKUP.forEach(function (k) { delete body[k]; });
+        body.tags = [];
+        return body;
     }
 
     async function addToRadarr(match) {
+        if (!CFG.radarrUrl) throw new Error('Falta la direccion de Radarr: menu de Tampermonkey, ajustes');
         if (!CFG.radarrKey) throw new Error('Falta la API key de Radarr');
         if (!CFG.radarrProfileId || !CFG.radarrRoot) throw new Error('Configura perfil de calidad y carpeta raíz de Radarr');
 
@@ -1016,12 +1204,16 @@
                 timeout: 60000
             });
         } catch (e) {
-            throw errorDeMetadatos(e, 'Radarr', IDX.radarr);
+            throw await errorDeMetadatos(e, 'Radarr');
         }
+        // Un 200 que no sea una ficha —un objeto de error, una cadena— colaba un
+        // cuerpo de basura en el POST y el script cantaba "Enviada" tan tranquilo.
         const base_ = Array.isArray(found) ? found[0] : found;
-        if (!base_) throw new Error('Radarr no encuentra ese tmdbId');
+        if (!base_ || typeof base_ !== 'object' || !base_.tmdbId) {
+            throw new Error('Radarr no devuelve una ficha valida para ese tmdbId');
+        }
 
-        const body = Object.assign({}, base_, {
+        const body = Object.assign(limpiarDelLookup(base_), {
             qualityProfileId: CFG.radarrProfileId,
             rootFolderPath: CFG.radarrRoot,
             minimumAvailability: CFG.radarrMinAvail || 'released',
@@ -1036,7 +1228,7 @@
                 body: JSON.stringify(body), timeout: 60000
             });
         } catch (e) {
-            throw errorDeMetadatos(e, 'Radarr', IDX.radarr);
+            throw await errorDeMetadatos(e, 'Radarr');
         }
 
         // Refleja el alta en el índice para que el resto de chips de la página coincida.
@@ -1047,6 +1239,7 @@
     }
 
     async function addToSonarr(match, tvdbId) {
+        if (!CFG.sonarrUrl) throw new Error('Falta la direccion de Sonarr: menu de Tampermonkey, ajustes');
         if (!CFG.sonarrKey) throw new Error('Falta la API key de Sonarr');
         if (!CFG.sonarrProfileId || !CFG.sonarrRoot) throw new Error('Configura perfil de calidad y carpeta raíz de Sonarr');
 
@@ -1073,16 +1266,24 @@
                     timeout: 60000
                 });
                 if (Array.isArray(found) && found.length) { base_ = found[0]; break; }
+                // Este término ha contestado aunque venga vacío: el fallo anterior
+                // ya no explica nada, y arrastrarlo hacía culpar a Cloudflare de
+                // una serie que Sonarr sencillamente no encuentra.
+                ultimoFallo = null;
             } catch (e) {
                 ultimoFallo = e;   // se prueba el siguiente término
             }
         }
         if (!base_) {
-            if (ultimoFallo) throw errorDeMetadatos(ultimoFallo, 'Sonarr', IDX.sonarr);
+            if (ultimoFallo) throw await errorDeMetadatos(ultimoFallo, 'Sonarr');
             throw new Error('Sonarr no encuentra esa serie');
         }
 
-        const body = Object.assign({}, base_, {
+        if (typeof base_ !== 'object' || !(base_.tvdbId || base_.title)) {
+            throw new Error('Sonarr no devuelve una ficha valida para esa serie');
+        }
+
+        const body = Object.assign(limpiarDelLookup(base_), {
             qualityProfileId: CFG.sonarrProfileId,
             rootFolderPath: CFG.sonarrRoot,
             seasonFolder: true,
@@ -1104,7 +1305,7 @@
                 body: JSON.stringify(body), timeout: 60000
             });
         } catch (e) {
-            throw errorDeMetadatos(e, 'Sonarr', IDX.sonarr);
+            throw await errorDeMetadatos(e, 'Sonarr');
         }
 
         if (IDX.sonarr) {
@@ -1113,6 +1314,19 @@
             if (IDX.sonarr.byTmdb) IDX.sonarr.byTmdb[match.id] = ref;
         }
         return created;
+    }
+
+    // El alta se reflejaba solo en memoria: al cambiar de página, el índice
+    // guardado seguía diciendo que no la tenías durante las seis horas de
+    // caducidad, y volver a pulsar acababa en un 400 "ya estaba añadida".
+    function guardarIndices() {
+        try {
+            const cache = readMap(IDX_KEY);
+            ['plex', 'radarr', 'sonarr'].forEach(function (n) {
+                if (IDX[n] && !IDX[n].error && cache[n]) cache[n].data = IDX[n];
+            });
+            writeJSON(IDX_KEY, cache);
+        } catch (e) { /* si no cabe, se reconstruye al caducar */ }
     }
 
     async function sendToService(match, status) {
@@ -1230,14 +1444,27 @@
 
     function mountCard(card) {
         const meta = extractFromCard(card);
-        if (!meta.faId) return;
+        if (!meta.faId || !/^\d+$/.test(meta.faId)) return;
+        if (SELF_FILM_ID && meta.faId === SELF_FILM_ID) return;
         const host = card.querySelector('.mc-poster') ||
                      card.querySelector('.poster-col a') ||
                      card.querySelector('.poster-col');
-        if (!host || hasChip(host)) return;
-        host.classList.add('fam-wrap');
-        const chip = makeChip(meta, 'corner');
-        host.appendChild(chip);
+        if (host) {
+            if (hasChip(host)) return;
+            host.classList.add('fam-wrap');
+            const chip = makeChip(meta, 'corner');
+            host.appendChild(chip);
+            io.observe(chip);
+            return;
+        }
+        // Sin póster no había dónde colgarlo, y mountAnchor descarta todo enlace
+        // que esté dentro de una .movie-card: la tarjeta se quedaba sin ningún
+        // distintivo. El enlace del título sirve igual.
+        const titulo = card.querySelector('.mc-title a') || card.querySelector('a[href*="/film"]');
+        if (!titulo || !titulo.parentElement) return;
+        if (titulo.parentElement.querySelector(':scope > .fam-chip')) return;
+        const chip = makeChip(meta, 'inline');
+        titulo.insertAdjacentElement('afterend', chip);
         io.observe(chip);
     }
 
@@ -1249,6 +1476,16 @@
         if (!meta.faId) return;
         if (SELF_FILM_ID && meta.faId === SELF_FILM_ID) return;   // enlace a la propia ficha
 
+        // La misma ficha, enlazada dos veces dentro del mismo bloque, sacaba dos
+        // distintivos: cada rama deduplicaba con un criterio distinto.
+        const bloque = a.closest('li, .mc-info-container, .movie-card, p, div') || a.parentElement;
+        if (bloque && bloque.querySelector('.fam-chip')) {
+            const yaEsta = Array.prototype.some.call(bloque.querySelectorAll('.fam-chip'), function (n) {
+                return n._meta && n._meta.faId === meta.faId;
+            });
+            if (yaEsta) return;
+        }
+
         const img = a.querySelector('img');
         if (img) {
             const host = a.querySelector('.mc-oposter, .fa-movie-poster') || a;
@@ -1258,6 +1495,9 @@
             host.appendChild(chip);
             io.observe(chip);
         } else {
+            // Capas transparentes e iconos: enlazan a la ficha pero no son el
+            // título, y sin texto el distintivo sale con la etiqueta vacía.
+            if (!(a.textContent || '').trim()) return;
             const host = a.parentElement;
             if (!host) return;
             const dup = Array.prototype.some.call(host.children, function (n) {
@@ -1277,8 +1517,12 @@
         const faId = idFromHref(location.pathname);
         if (!faId) return;
         const meta = readFicha(document, faId);
-        store.meta[faId] = meta;
-        flushSoon();
+        // Misma criba que fetchFicha: una ficha de la que no se ha sacado nada
+        // no se guarda. Guardarla dejaba la película envenenada en la caché.
+        if (meta && (meta.original || meta.year || meta.title)) {
+            store.meta[faId] = meta;
+            flushSoon();
+        }
         const chip = makeChip(meta, 'big');
         h1.appendChild(chip);
         process(chip);   // en la ficha no se espera al scroll
@@ -1367,18 +1611,28 @@
         if (state === 'error') return process(chip);
     }
 
+    // La misma película lleva varios distintivos en una página. Pulsar dos a la
+    // vez mandaba dos altas, y la segunda volvía con un 400 en rojo.
+    const ENVIANDO = new Set();
+
     async function doAdd(chip) {
         const match = chip._match;
         const service = match.kind === 'tv' ? 'Sonarr' : 'Radarr';
+        const clave = match.kind + ':' + match.id;
+        if (ENVIANDO.has(clave)) return;
+        ENVIANDO.add(clave);
         setChip(chip, 'busy', 'Enviando a ' + service);
         try {
             await sendToService(match, chip._status);
+            guardarIndices();
             toast('Enviada a ' + service + ': ' + (match.title || ''));
             refreshMatching(function (c) { return c._match.kind === match.kind && c._match.id === match.id; });
         } catch (err) {
             setChip(chip, 'error', 'Error: ' + (err.message || err));
             toast('No se pudo enviar a ' + service + ': ' + (err.message || err), true);
             setTimeout(function () { if (chip._state === 'error') applyStatus(chip); }, 5000);
+        } finally {
+            ENVIANDO.delete(clave);
         }
     }
 
@@ -1386,9 +1640,16 @@
         const st = chip._status;
         if (!st || !st.ratingKey) return;
         const key = encodeURIComponent('/library/metadata/' + st.ratingKey);
+        const raiz = base(CFG.plexUrl);
+        // Sin identificador de servidor ni direccion, la URL quedaba relativa y
+        // el navegador acababa en la propia web con una ruta que no existe.
+        if (!st.machine && !raiz) {
+            toast('No se puede abrir en Plex: falta la direccion del servidor en los ajustes', true);
+            return;
+        }
         const url = st.machine
             ? 'https://app.plex.tv/desktop/#!/server/' + st.machine + '/details?key=' + key
-            : base(CFG.plexUrl) + '/web/index.html#!/server/local/details?key=' + key;
+            : raiz + '/web/index.html#!/server/local/details?key=' + key;
         window.open(url, '_blank', 'noopener');
     }
 
@@ -1397,6 +1658,11 @@
         const st = chip._status || {};
         const slug = st.arr ? st.arr.slug : '';
         const root = match.kind === 'tv' ? base(CFG.sonarrUrl) : base(CFG.radarrUrl);
+        if (!root) {
+            toast('No se puede abrir: falta la direccion del servicio en los ajustes', true);
+            return;
+        }
+        if (!slug) toast('Sin ficha concreta: se abre la portada del servicio');
         const path = slug ? (match.kind === 'tv' ? '/series/' + slug : '/movie/' + slug) : '';
         window.open(root + path, '_blank', 'noopener');
     }
@@ -1690,6 +1956,10 @@
     function progReiniciar() {
         PROG.terminado = false;
         PROG.servicios = {};
+        // Sin poner a cero la cuenta de fichas, la barra arrancaba casi llena:
+        // arrastraba todas las de la carga anterior como ya hechas.
+        PROG.fichas = 0;
+        PROG.hechas = 0;
     }
 
     /* ================================================================== *
@@ -1859,7 +2129,18 @@
             o.textContent = String(it[labelKey]);
             sel.appendChild(o);
         });
-        if (current !== null && current !== undefined && String(current)) sel.value = String(current);
+        if (current !== null && current !== undefined && String(current)) {
+            // Si lo guardado no está entre las opciones, se añade en vez de
+            // perderlo: al guardar, el desplegable devolvía "" y ese vacío
+            // acababa viajando a Radarr o a Sonarr en el alta.
+            if (sel.value !== String(current)) {
+                const extra = document.createElement('option');
+                extra.value = String(current);
+                extra.textContent = String(current) + ' (actual)';
+                sel.appendChild(extra);
+            }
+            sel.value = String(current);
+        }
     }
 
     function openSettings() {
@@ -1948,6 +2229,10 @@
 
         function close() {
             if (host.parentNode) host.parentNode.removeChild(host);
+            // El permiso que da "Probar conexion" vale solo mientras el panel
+            // esta abierto: al guardar, la direccion ya entra por la
+            // configuracion, y al cancelar no debe quedar rastro.
+            EXTRA_HOSTS.length = 0;
         }
 
         $('cancel').addEventListener('click', close);
@@ -1961,8 +2246,9 @@
             CFG.sonarrProfileId = parseInt($('sonarrProfileId').value, 10) || null;
             CFG.radarrSearch = $('radarrSearch').checked;
             CFG.sonarrSearch = $('sonarrSearch').checked;
-            CFG.indexTtlHours = parseInt($('indexTtlHours').value, 10) || 6;
-            CFG.concurrency = parseInt($('concurrency').value, 10) || 6;
+            const horasPanel = parseInt($('indexTtlHours').value, 10);
+            CFG.indexTtlHours = (isFinite(horasPanel) && horasPanel >= 1) ? Math.min(horasPanel, 168) : 6;
+            CFG.concurrency = limiteCola($('concurrency').value);
             writeJSON(CFG_KEY, CFG);
             close();
             toast('Ajustes guardados. Recargando indices...');
@@ -1982,7 +2268,9 @@
 
         $('clearCache').addEventListener('click', function () {
             store.map = {}; store.meta = {}; store.tvdb = {};
-            writeJSON(MAP_KEY, {}); writeJSON(META_KEY, {}); writeJSON(TVDB_KEY, {});
+            store.imdb = {};
+            clearTimeout(flushTimer); flushTimer = null;
+            writeJSON(MAP_KEY, {}); writeJSON(META_KEY, {}); writeJSON(TVDB_KEY, {}); writeJSON(IMDB_KEY, {});
             toast('Cache de coincidencias borrada. Recarga la pagina.');
         });
     }
@@ -2011,7 +2299,9 @@
         });
         GM_registerMenuCommand('FA-Monkey: borrar cache de coincidencias', function () {
             store.map = {}; store.meta = {}; store.tvdb = {};
-            writeJSON(MAP_KEY, {}); writeJSON(META_KEY, {}); writeJSON(TVDB_KEY, {});
+            store.imdb = {};
+            clearTimeout(flushTimer); flushTimer = null;
+            writeJSON(MAP_KEY, {}); writeJSON(META_KEY, {}); writeJSON(TVDB_KEY, {}); writeJSON(IMDB_KEY, {});
             toast('Cache borrada. Recarga la pagina.');
         });
 

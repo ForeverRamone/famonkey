@@ -68,6 +68,22 @@ Los catálogos de Plex, Radarr y Sonarr se descargan enteros una vez cada seis
 horas y se indexan por identificador (`tmdb`, `imdb`, `tvdb`). Navegar no genera
 ni una petición a esos servicios: solo se consulta el índice en memoria.
 
+Del catálogo de Plex solo se piden los cuatro datos que el índice mira: qué es,
+su identificador interno, el título con su año y los identificadores externos.
+La sinopsis, las rutas de los ficheros, el reparto, los géneros y los colores
+del póster se quedan en el servidor. Con unos miles de títulos eso es la
+diferencia entre descargar y procesar unos pocos megabytes o veinte. Como la
+capacidad de Plex para dejar campos fuera está documentada como limitada, el
+recorte se comprueba: si la respuesta recortada llega sin identificadores, o el
+servidor rechaza la petición, se vuelve a pedir el catálogo entero. Nunca se
+indexa a medias en silencio.
+
+Cuando el índice guardado ya ha caducado, se usa igualmente para pintar al
+momento y se descarga uno nuevo por detrás; los distintivos se corrigen solos
+en cuanto llega. Así solo se espera de verdad la primerísima vez. Lo único que
+sí aguarda al índice recién descargado es pulsar un distintivo para enviar algo:
+ahí interesa no mandar a Radarr una película que ya tienes.
+
 Cada clave del índice lleva delante si es película o serie, y no es un detalle
 menor: TMDB y TVDB numeran los dos catálogos por separado, así que el mismo
 número designa dos cosas distintas. `tmdb://8592` es *Dick Tracy* entre las
@@ -76,8 +92,11 @@ serie que no tienes se quedaba con la ficha de una película que sí, se marcaba
 como presente en Plex y al pulsarla abría la película.
 
 Lo único que se resuelve por título es su identificador de TMDB, y ese dato se
-cachea de forma permanente porque no cambia. La primera visita a la portada
-gasta unas cuantas búsquedas en TMDB; a partir de la segunda, ninguna.
+cachea porque no cambia. También se recuerdan los títulos que TMDB no reconoce:
+antes eran los únicos que repetían la búsqueda entera —y son los más caros, con
+varias consultas y la lectura de la ficha— en cada carga de cada página donde
+salieran. Ahora se anotan y se reintentan a los pocos días, por si TMDB todavía
+no tenía esa ficha. Lo que elijas a mano no caduca nunca.
 
 Para buscar en TMDB no se usa el título en español sino el original, que
 FilmAffinity deja al descubierto en el nombre del fichero del póster
@@ -92,18 +111,37 @@ cortometrajes `(C)` y los telefilmes `(TV)`, a Radarr.
 ### La primera carga
 
 La primera vez tarda, y ese rato tiene explicación: hay que descargar enteros
-los catálogos de Plex, Radarr y Sonarr —varios megabytes si la biblioteca es
-grande— y encima preguntar a TMDB por cada póster de la página. Mientras eso
-pasa, abajo a la derecha aparece una barrita que va diciendo por dónde va:
-primero qué servicio está leyendo y luego cuántos títulos lleva identificados.
-Se cierra sola al acabar, no vuelve a salir en el resto de la página, y si
-molesta se quita con un clic.
+los catálogos de Plex, Radarr y Sonarr y encima preguntar a TMDB por cada póster
+de la página. Mientras eso pasa, abajo a la derecha aparece una barrita que va
+diciendo por dónde va: primero qué servicio está leyendo y luego cuántos títulos
+lleva identificados. Se cierra sola al acabar, no vuelve a salir en el resto de
+la página, y si molesta se quita con un clic.
 
-Las dos esperas corren a la vez en lugar de una detrás de otra, las bibliotecas
-de Plex se piden en paralelo y las consultas repetidas de una misma página se
-agrupan en una sola: un póster y su título son dos enlaces distintos, pero
-preguntan lo mismo. De la segunda visita en adelante casi todo sale de la caché
-y la barra ni llega a asomar.
+Lo que se hace para que ese rato sea corto:
+
+- **La descarga empieza antes que la página.** El script arranca con el
+  documento, no cuando ya está montado, así que la petición a Plex sale mientras
+  FilmAffinity sigue cargando. Antes no salía ni una hasta que el primer póster
+  entraba en pantalla, o sea después de que el navegador hubiera terminado de
+  parsear la página, montar los distintivos y colocarlos.
+- **Del catálogo de Plex se pide solo lo que se usa**, que es una fracción de lo
+  que el servidor manda por defecto.
+- **Las dos esperas corren a la vez**, no una detrás de otra: identificar el
+  título en TMDB no necesita el índice.
+- **Cada distintivo espera solo lo que le hace falta.** Una película no espera a
+  Sonarr ni una serie a Radarr. Antes un Sonarr apagado retrasaba la pintada de
+  todas las películas.
+- **Las bibliotecas de Plex se piden en paralelo**, y las peticiones que no
+  hacen falta para construir el índice —el identificador del servidor, la
+  versión de Sonarr— ya no se esperan por delante de la descarga pesada.
+- **Las consultas repetidas de una misma página se agrupan en una sola:** un
+  póster y su título son dos enlaces distintos, pero preguntan lo mismo.
+- **Un 429 de TMDB se reintenta** con una espera creciente, respetando la
+  cabecera `Retry-After`. Antes se traducía en un distintivo rojo, o peor, en un
+  "sin coincidencia" que no era verdad.
+
+De la segunda visita en adelante casi todo sale de la caché y la barra ni llega
+a asomar.
 
 ### Películas que se llaman igual
 
@@ -119,8 +157,9 @@ la búsqueda no filtra por año de entrada, ya que filtrar dejaría fuera la
 película buena y le regalaría la partida a cualquier homónima que sí cuadre.
 
 Si aun así hay empate, decide la dirección: FilmAffinity la da en la ficha y
-TMDB en los créditos. Se consulta solo cuando hace falta y como mucho para tres
-candidatas.
+TMDB en los créditos. Se consulta solo cuando hace falta, como mucho para cinco
+candidatas, y las cinco se preguntan a la vez: la elegida es la misma que si se
+preguntaran una a una, pero se tarda una ida y vuelta en lugar de cinco.
 
 ### Series con una ficha por temporada
 

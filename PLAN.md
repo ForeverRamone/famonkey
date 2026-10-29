@@ -57,7 +57,9 @@ Nada de una consulta por película. Se cargan **índices completos una sola vez*
 consultan en memoria. Lo único que se resuelve por película es su TMDB id, y ese mapeo
 se cachea de forma permanente porque no cambia nunca.
 
-Primera visita a portada: ~50 búsquedas en TMDB. Visitas siguientes: cero peticiones.
+Primera visita a portada: ~50 búsquedas en TMDB. Visitas siguientes: cero
+peticiones. Para que eso valga también para los títulos que TMDB no reconoce, el
+"no hay coincidencia" se cachea igual que el acierto, con una caducidad corta.
 
 ## 3. Resolución FA -> TMDB (cascada)
 
@@ -83,8 +85,14 @@ buscan primero como película y luego como serie.
 - Soportar también el agente antiguo, que devuelve
   `com.plexapp.agents.imdb://tt0133093?lang=en` en el campo `guid`.
 - `machineIdentifier` desde `GET {plex}/identity`, para poder enlazar al item.
-- Se guarda compacto: GUID -> `{ratingKey, type}`, más un índice de respaldo por
-  título normalizado + año.
+- Se guarda compacto: GUID -> `ratingKey`, más un índice de respaldo por título
+  normalizado + año. El medio (`movie` / `tv`) va delante de la clave, así que no
+  hace falta guardarlo también en el valor.
+- Se piden fuera los campos y elementos que el índice no mira (`excludeFields`,
+  `excludeElements`): la sinopsis, las rutas de los ficheros, el reparto y los
+  géneros son la mayor parte de la descarga y no se usan. Como el soporte de esos
+  parámetros está documentado como limitado, si la respuesta recortada llega sin
+  GUIDs —o el servidor la rechaza— se vuelve a pedir el catálogo entero.
 - Cabecera `X-Plex-Token` y `Accept: application/json`.
 
 ### Radarr
@@ -95,7 +103,9 @@ buscan primero como película y luego como serie.
 Cuando haga falta traducir TMDB -> TVDB: `GET /tv/{id}/external_ids` de TMDB, cacheado.
 
 TTL de los índices: 6 h, con refresco manual desde el panel y refresco automático
-después de añadir algo.
+después de añadir algo. Caducado no es inservible: se pinta con lo guardado y se
+descarga uno nuevo por detrás, repintando al llegar. Un alta sí espera a tener el
+índice al día, para no mandar algo que ya estaba.
 
 ## 5. Alta en Radarr / Sonarr
 
@@ -168,5 +178,7 @@ Bugs encontrados y corregidos durante esa verificación:
 - FilmAffinity cambia el marcado. Mitigación: todos los selectores en un único módulo.
 - Títulos sin año en portada. Mitigación: la cascada de resolución y el selector manual.
 - Series sin `tvdb_id` en TMDB. Mitigación: lookup en Sonarr por `tmdb:` como respaldo.
-- Escritura en `GM_setValue` con miles de entradas. Mitigación: mapa en memoria y
-  volcado diferido.
+- Escritura en `GM_setValue` con miles de entradas. Mitigación: mapa en memoria,
+  volcado diferido, un valor por almacén y por servicio —para no reescribir el
+  catálogo de Plex al anotar un tvdb— y poda de lo más antiguo al pasar del tope,
+  salvo lo elegido a mano.

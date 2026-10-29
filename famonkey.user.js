@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         FA-Monkey — Plex / Radarr / Sonarr en FilmAffinity
 // @namespace    famonkey
-// @version      1.8.0
+// @version      1.9.0
 // @description  Marca sobre cada póster de FilmAffinity si la película o serie ya está en tu Plex, y envía a Radarr o Sonarr con un clic las que faltan.
 // @author       ForeverRamone
 // @match        https://www.filmaffinity.com/*
 // @updateURL    https://raw.githubusercontent.com/ForeverRamone/famonkey/main/famonkey.user.js
 // @downloadURL  https://raw.githubusercontent.com/ForeverRamone/famonkey/main/famonkey.user.js
-// @run-at       document-idle
+// @run-at       document-start
 // @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -32,12 +32,22 @@
     const META_KEY = 'famonkey.meta';   // faId  -> datos leídos de la ficha
     const TVDB_KEY = 'famonkey.tvdb';   // tmdb  -> tvdb (solo series)
     const IMDB_KEY = 'famonkey.imdb';   // tmdb  -> imdb (bibliotecas con agente antiguo)
-    const IDX_KEY  = 'famonkey.index';  // índices de Plex / Radarr / Sonarr
+    const IDX_KEY  = 'famonkey.index';  // sólo para borrar lo de versiones viejas
+
+    // Un único valor con los tres índices dentro obligaba a parsearlo y a
+    // reescribirlo entero para tocar una parte: anotar un alta en Radarr costaba
+    // serializar el catálogo completo de Plex, y eso con la biblioteca grande son
+    // megas y una pestaña congelada. Uno por servicio.
+    const IDX_KEYS = {
+        plex:   'famonkey.index.plex',
+        radarr: 'famonkey.index.radarr',
+        sonarr: 'famonkey.index.sonarr'
+    };
 
     // Sube cuando cambia la forma de las claves del índice. Lo guardado con una
     // versión anterior se tira y se vuelve a descargar, en vez de consultarse
     // mal y dar por buenas coincidencias que no lo son.
-    const IDX_VERSION = 2;
+    const IDX_VERSION = 3;
 
     const DEFAULTS = {
         tmdbKey: '',
@@ -86,35 +96,87 @@
 
     let CFG = Object.assign({}, DEFAULTS, readMap(CFG_KEY));
 
+    const CLAVE_ALMACEN = { map: MAP_KEY, meta: META_KEY, tvdb: TVDB_KEY, imdb: IMDB_KEY };
+
     const store = {
         map:  readMap(MAP_KEY),
-        meta: readMap(META_KEY),
-        tvdb: readMap(TVDB_KEY),
-        imdb: readMap(IMDB_KEY)
+        meta: readMap(META_KEY)
     };
 
+    // El mapa de coincidencias y las fichas se consultan por cada título, así
+    // que se leen de entrada. Los dos catálogos de identificadores externos sólo
+    // hacen falta al pintar el estado, y en una biblioteca moderna el de imdb no
+    // se mira nunca: parsearlos en el arranque era trabajo en el camino crítico
+    // a cambio de nada.
+    ['tvdb', 'imdb'].forEach(function (nombre) {
+        const clave = CLAVE_ALMACEN[nombre];
+        let valor = null;
+        Object.defineProperty(store, nombre, {
+            configurable: true,
+            get: function () { return valor || (valor = readMap(clave)); },
+            set: function (v) { valor = v; }
+        });
+    });
+
+    // Los almacenes crecían sin tope: cada título visto dejaba su entrada para
+    // siempre, y al arrancar había que parsearlas todas. Se tiran las más viejas
+    // cuando sobra, y las elegidas a mano no se tiran nunca.
+    const TOPE_ALMACEN = { map: 8000, meta: 4000 };
+
+    function podar(nombre) {
+        const tope = TOPE_ALMACEN[nombre];
+        const obj = store[nombre];
+        if (!tope || !obj) return;
+        const claves = Object.keys(obj);
+        let sobran = claves.length - tope;
+        if (sobran <= 0) return;
+        const sueltas = claves.filter(function (k) { return !(obj[k] && obj[k].m); });
+        // Las guardadas por una versión anterior no llevan fecha: se van antes,
+        // que es justo lo que interesa.
+        sueltas.sort(function (a, b) {
+            return ((obj[a] && obj[a].ts) || 0) - ((obj[b] && obj[b].ts) || 0);
+        });
+        for (let i = 0; i < sueltas.length && sobran > 0; i++, sobran--) delete obj[sueltas[i]];
+    }
+
+    // Se reescribe sólo lo que ha cambiado: antes se salvaban los cuatro
+    // almacenes siempre, y serializar el mapa entero para anotar un tvdb costaba
+    // mucho más que el dato que se estaba guardando.
+    const SUCIOS = new Set();
     let flushTimer = null;
 
     function flushYa() {
         clearTimeout(flushTimer);
         flushTimer = null;
-        writeJSON(MAP_KEY,  store.map);
-        writeJSON(META_KEY, store.meta);
-        writeJSON(TVDB_KEY, store.tvdb);
-        writeJSON(IMDB_KEY, store.imdb);
+        SUCIOS.forEach(function (nombre) {
+            podar(nombre);
+            writeJSON(CLAVE_ALMACEN[nombre], store[nombre]);
+        });
+        SUCIOS.clear();
     }
 
-    function flushSoon() {
+    // Sin nombre se marcan los cuatro: así una llamada que se quedara sin
+    // etiquetar guarda de más, nunca de menos.
+    function flushSoon(nombre) {
+        if (nombre) SUCIOS.add(nombre);
+        else Object.keys(CLAVE_ALMACEN).forEach(function (n) { SUCIOS.add(n); });
         clearTimeout(flushTimer);
         flushTimer = setTimeout(flushYa, 1500);
     }
 
-    // El respiro de flushSoon se reprograma con cada dato nuevo, así que
-    // cerrar la pestaña mientras la página seguía resolviendo tiraba todo lo
-    // aprendido y había que volver a preguntarlo entero.
-    window.addEventListener('pagehide', flushYa);
+    // El respiro de flushSoon se reprograma con cada dato nuevo, así que cerrar
+    // la pestaña mientras la página seguía resolviendo tiraba todo lo aprendido y
+    // había que volver a preguntarlo entero. El índice se escribe además en un
+    // hueco libre del hilo, y cerrar antes de ese hueco obligaba a descargarlo
+    // otra vez entero: aquí se vuelca lo uno y lo otro.
+    function cerrarCuentas() {
+        flushYa();
+        volcarIndices();
+    }
+
+    window.addEventListener('pagehide', cerrarCuentas);
     document.addEventListener('visibilitychange', function () {
-        if (document.visibilityState === 'hidden') flushYa();
+        if (document.visibilityState === 'hidden') cerrarCuentas();
     });
 
     /* ================================================================== *
@@ -182,6 +244,19 @@
         return host === dominio || host.slice(-(dominio.length + 1)) === '.' + dominio;
     }
 
+    // TMDB responde 429 cuando se le aprieta, y un Plex o un Radarr ocupado
+    // devuelve 503. Cualquier respuesta que no fuera 2xx se traducía en un
+    // distintivo rojo —o en un "sin coincidencia" falso— sin volver a intentarlo,
+    // justo en la primera carga, que es cuando más peticiones salen de golpe.
+    const REINTENTOS = 3;
+
+    function esperaDe(cabeceras, intento) {
+        const m = /retry-after:\s*(\d+)/i.exec(String(cabeceras || ''));
+        const pedida = m ? parseInt(m[1], 10) * 1000 : 0;
+        if (pedida > 0) return Math.min(pedida, 10000);
+        return Math.min(500 * Math.pow(2, intento), 4000);
+    }
+
     function gmFetch(opts) {
         return new Promise(function (resolve, reject) {
             // Segunda barrera: sólo se sale a direcciones absolutas. Una
@@ -201,6 +276,14 @@
                 timeout: opts.timeout || 30000,
                 onload: function (r) {
                     if (r.status >= 200 && r.status < 300) return resolve(r);
+                    const intento = opts.intento || 0;
+                    if ((r.status === 429 || r.status === 503) && intento < REINTENTOS) {
+                        const espera = esperaDe(r.responseHeaders, intento);
+                        return setTimeout(function () {
+                            gmFetch(Object.assign({}, opts, { intento: intento + 1 }))
+                                .then(resolve, reject);
+                        }, espera);
+                    }
                     let detail = '';
                     try {
                         const j = JSON.parse(r.responseText);
@@ -251,7 +334,15 @@
         return (isFinite(v) && v >= 1) ? Math.min(v, 12) : 6;
     }
 
-    const queue = makeQueue(limiteCola(CFG.concurrency));
+    // Una sola cola envolvía la resolución completa de un título: la cascada de
+    // búsquedas, la descarga de la ficha y los desempates por director ocupaban
+    // un hueco entero durante quince o veinte idas y vueltas, y los títulos que
+    // se resuelven con una sola consulta esperaban detrás. Ahora lo que se limita
+    // es el número de peticiones en vuelo contra cada servidor, que es lo que de
+    // verdad hay que cuidar, y los títulos avanzan a la vez.
+    const colaTmdb  = makeQueue(limiteCola(CFG.concurrency));
+    // La ficha es una página HTML de la propia web: se piden pocas a la vez.
+    const colaFicha = makeQueue(2);
 
     /* ================================================================== *
      * 3. TMDB
@@ -299,7 +390,9 @@
 
         const params = { query: query, language: 'es-ES', include_adult: 'false' };
         if (year) params[kind === 'movie' ? 'primary_release_year' : 'first_air_date_year'] = String(year);
-        const pendiente = gmJSON({ url: tmdbUrl('/search/' + kind, params) })
+        const pendiente = colaTmdb(function () {
+            return gmJSON({ url: tmdbUrl('/search/' + kind, params) });
+        })
             .then(function (data) {
                 return (data.results || []).slice(0, 10).map(function (r) { return tmdbItem(kind, r); });
             });
@@ -314,17 +407,43 @@
     async function tmdbDirectores(item) {
         const clave = item.kind + ':' + item.id;
         if (CACHE_DIRECTORES.has(clave)) return CACHE_DIRECTORES.get(clave);
-        const data = await gmJSON({ url: tmdbUrl('/' + item.kind + '/' + item.id + '/credits', {}) });
-        const nombres = (data.crew || [])
-            .filter(function (c) { return c.job === 'Director'; })
-            .map(function (c) { return c.name; });
-        CACHE_DIRECTORES.set(clave, nombres);
-        return nombres;
+        // Se guarda la promesa, no el resultado: dos títulos dudosos que caen en
+        // la misma candidata pedían sus directores dos veces a la vez.
+        const pendiente = colaTmdb(function () {
+            return gmJSON({ url: tmdbUrl('/' + item.kind + '/' + item.id + '/credits', {}) });
+        }).then(function (data) {
+            return (data.crew || [])
+                .filter(function (c) { return c.job === 'Director'; })
+                .map(function (c) { return c.name; });
+        });
+        CACHE_DIRECTORES.set(clave, pendiente);
+        pendiente.catch(function () { CACHE_DIRECTORES.delete(clave); });
+        return pendiente;
     }
 
     async function tmdbPorId(kind, id) {
-        const data = await gmJSON({ url: tmdbUrl('/' + kind + '/' + id, { language: 'es-ES' }) });
+        const data = await colaTmdb(function () {
+            return gmJSON({ url: tmdbUrl('/' + kind + '/' + id, { language: 'es-ES' }) });
+        });
         return tmdbItem(kind, data);
+    }
+
+    // Los identificadores externos salían sin encolar y sin deduplicar: una
+    // página de títulos que no tienes disparaba una petición por distintivo,
+    // todas a la vez, y los dos distintivos de la misma película —el póster y el
+    // título— preguntaban por separado. Era la vía más rápida para que TMDB
+    // empezara a responder 429. Se guarda la promesa, no sólo el resultado.
+    const EXTERNOS = new Map();
+
+    function externalIds(ruta) {
+        const enCurso = EXTERNOS.get(ruta);
+        if (enCurso) return enCurso;
+        const pendiente = colaTmdb(function () {
+            return gmJSON({ url: tmdbUrl(ruta + '/external_ids', {}) });
+        });
+        EXTERNOS.set(ruta, pendiente);
+        pendiente.catch(function () { EXTERNOS.delete(ruta); });
+        return pendiente;
     }
 
     // Sólo se pregunta cuando la biblioteca de Plex tiene fichas indexadas por
@@ -332,17 +451,17 @@
     async function tmdbImdbId(kind, tmdbId) {
         const clave = kind + ':' + tmdbId;
         if (Object.prototype.hasOwnProperty.call(store.imdb, clave)) return store.imdb[clave];
-        const data = await gmJSON({ url: tmdbUrl('/' + kind + '/' + tmdbId + '/external_ids', {}) });
+        const data = await externalIds('/' + kind + '/' + tmdbId);
         store.imdb[clave] = data.imdb_id || null;
-        flushSoon();
+        flushSoon('imdb');
         return store.imdb[clave];
     }
 
     async function tmdbTvdbId(tmdbId) {
         if (Object.prototype.hasOwnProperty.call(store.tvdb, tmdbId)) return store.tvdb[tmdbId];
-        const data = await gmJSON({ url: tmdbUrl('/tv/' + tmdbId + '/external_ids', {}) });
+        const data = await externalIds('/tv/' + tmdbId);
         store.tvdb[tmdbId] = data.tvdb_id || null;
-        flushSoon();
+        flushSoon('tvdb');
         return store.tvdb[tmdbId];
     }
 
@@ -535,7 +654,9 @@
 
     async function fetchFicha(faId) {
         try {
-            const r = await gmFetch({ url: 'https://www.filmaffinity.com/es/film' + faId + '.html' });
+            const r = await colaFicha(function () {
+                return gmFetch({ url: 'https://www.filmaffinity.com/es/film' + faId + '.html' });
+            });
             const doc = new DOMParser().parseFromString(r.responseText, 'text/html');
             const data = readFicha(doc, faId);
             return (data && (data.original || data.year)) ? data : null;
@@ -757,18 +878,34 @@
         const objetivo = norm(meta.director);
         if (!objetivo) return null;
 
-        for (const item of candidatos.slice(0, 5)) {
-            if (item.kind !== 'movie') continue;   // en series FilmAffinity da el creador
-            let directores;
-            try {
-                directores = await tmdbDirectores(item);
-            } catch (e) {
-                continue;
-            }
-            const coincide = directores.some(function (d) { return norm(d) === objetivo; });
-            if (coincide) return item;
+        // Se preguntaban una detrás de otra, parando en la primera que cuadraba:
+        // cinco idas y vueltas encadenadas para un título que ya era dudoso. Se
+        // piden a la vez y se recorre el resultado en el mismo orden, así que la
+        // elegida es exactamente la misma que antes.
+        const lista = candidatos.slice(0, 5)
+            .filter(function (i) { return i.kind === 'movie'; });   // en series FilmAffinity da el creador
+        if (!lista.length) return null;
+        const fichas = await Promise.all(lista.map(function (i) {
+            return tmdbDirectores(i).catch(function () { return []; });
+        }));
+        for (let i = 0; i < lista.length; i++) {
+            if (fichas[i].some(function (d) { return norm(d) === objetivo; })) return lista[i];
         }
         return null;
+    }
+
+    // Lo elegido a mano vale para siempre. Lo que decidió el script caduca: una
+    // coincidencia buena aguanta de sobra tres meses, y un "no la encuentro" se
+    // vuelve a intentar a los pocos días. Lo guardado por una versión anterior no
+    // lleva fecha y se respeta tal cual, para no tirar la caché de nadie.
+    const TTL_MAP_SI = 90 * 24 * 3600 * 1000;
+    const TTL_MAP_NO =  3 * 24 * 3600 * 1000;
+
+    function vigente(entrada) {
+        if (!entrada) return null;
+        if (entrada.m || !entrada.ts) return entrada;
+        const ttl = entrada.none ? TTL_MAP_NO : TTL_MAP_SI;
+        return (Date.now() - entrada.ts) < ttl ? entrada : null;
     }
 
     async function resolveMatch(metaCruda) {
@@ -780,9 +917,12 @@
         // temporada que sólo constaba ahí.
         let full = normalizarSerie(mezclarMeta(metaCruda, store.meta[metaCruda.faId]));
 
-        const cached = store.map[metaCruda.faId];
+        const cached = vigente(store.map[metaCruda.faId]);
         if (cached) {
-            if (cached.none) return { match: null, candidates: [], ignored: true, meta: full };
+            // Un "no hay coincidencia" guardado por el script y uno marcado a
+            // mano se consultan igual, pero no se cuentan igual: el tooltip del
+            // segundo dice que está ignorada, y el del primero invita a elegir.
+            if (cached.none) return { match: null, candidates: [], ignored: !!cached.m, meta: full };
             return {
                 match: { kind: cached.k, id: cached.i, title: cached.t || full.title, year: cached.y || full.year },
                 cached: true,
@@ -800,7 +940,7 @@
             const extra = await fetchFicha(metaCruda.faId);
             if (extra) {
                 store.meta[metaCruda.faId] = extra;
-                flushSoon();
+                flushSoon('meta');
                 full = normalizarSerie(mezclarMeta(metaCruda, extra));
 
                 const pool = out.pool || new Map();
@@ -842,9 +982,19 @@
         }
 
         if (out.match) {
-            store.map[metaCruda.faId] = { k: out.match.kind, i: out.match.id, t: out.match.title, y: out.match.year };
-            flushSoon();
+            store.map[metaCruda.faId] = {
+                k: out.match.kind, i: out.match.id,
+                t: out.match.title, y: out.match.year, ts: Date.now()
+            };
+        } else {
+            // Sólo se guardaban los aciertos. Un título que no casa repetía la
+            // cascada entera —hasta treinta consultas a TMDB entre búsquedas,
+            // ficha y desempates— en cada carga de cada página donde apareciera,
+            // para siempre. Ahora se anota el fallo y se reintenta a los pocos
+            // días, por si TMDB todavía no tenía la ficha.
+            store.map[metaCruda.faId] = { none: 1, ts: Date.now() };
         }
+        flushSoon('map');
         out.meta = full;
         return out;
     }
@@ -856,7 +1006,7 @@
 
     function resolveMatchUnaVez(meta) {
         const clave = meta && meta.faId;
-        const arrancar = function () { return queue(function () { return resolveMatch(meta); }); };
+        const arrancar = function () { return resolveMatch(meta); };
         if (!clave) return arrancar();
 
         const enCurso = RESOLVIENDO.get(clave);
@@ -869,10 +1019,11 @@
         return tarea;
     }
 
+    // La marca m distingue lo elegido a mano: no caduca, y la poda no lo tira.
     function rememberChoice(faId, item) {
         if (item) store.map[faId] = { k: item.kind, i: item.id, t: item.title, y: item.year, m: 1 };
-        else store.map[faId] = { none: 1 };
-        flushSoon();
+        else store.map[faId] = { none: 1, m: 1 };
+        flushSoon('map');
     }
 
     /* ================================================================== *
@@ -897,7 +1048,13 @@
             }
         }
         // Agentes antiguos: com.plexapp.agents.imdb://tt0133093?lang=es
-        const legacy = /com\.plexapp\.agents\.(imdb|themoviedb|thetvdb):\/\/([^?/]+)/.exec(String(item.guid || ''));
+        // En una biblioteca moderna el guid empieza por "plex://" y esta regex
+        // fallaba en los cien por cien de los títulos: se comprueba el prefijo
+        // antes, que es una comparación de cadena y no un recorrido.
+        const crudo = String(item.guid || '');
+        const legacy = crudo.lastIndexOf('com.plexapp.agents.', 0) === 0
+            ? /com\.plexapp\.agents\.(imdb|themoviedb|thetvdb):\/\/([^?/]+)/.exec(crudo)
+            : null;
         if (legacy) {
             const kind = { imdb: 'imdb', themoviedb: 'tmdb', thetvdb: 'tvdb' }[legacy[1]];
             out.push(kind + ':' + legacy[2]);
@@ -905,16 +1062,67 @@
         return out;
     }
 
+    // De cada título el índice mira cuatro cosas: el tipo, el ratingKey, el
+    // título con su año y los identificadores externos. El listado de una
+    // biblioteca trae además la sinopsis, las rutas de los ficheros, el reparto,
+    // los géneros, las valoraciones y hasta los colores del fondo del póster:
+    // con unos miles de títulos eso son decenas de megas que hay que transferir
+    // y parsear antes de poder pintar el primer distintivo. Se piden fuera.
+    //
+    // La capacidad de Plex para excluir campos está documentada como limitada,
+    // así que esto es una optimización que se comprueba: si la respuesta recortada
+    // llega sin identificadores, se vuelve a pedir entera (ver pedirBiblioteca).
+    const PLEX_FUERA_CAMPOS = [
+        'summary', 'tagline', 'titleSort', 'originalTitle', 'art', 'thumb',
+        'banner', 'theme', 'studio', 'contentRating', 'slug', 'chapterSource',
+        'primaryExtraKey', 'audienceRatingImage', 'ratingImage',
+        'originallyAvailableAt', 'duration'
+    ].join(',');
+
+    const PLEX_FUERA_ELEMENTOS = [
+        'Media', 'Part', 'Stream', 'Genre', 'Country', 'Director', 'Writer',
+        'Producer', 'Role', 'Rating', 'Image', 'UltraBlurColors', 'Collection',
+        'Label', 'Similar', 'Chapter', 'Marker', 'Extras', 'Field', 'Location',
+        'Preferences', 'Review', 'Mood', 'Style'
+    ].join(',');
+
+    function urlBiblioteca(root, key, recortar) {
+        let url = root + '/library/sections/' + encodeURIComponent(key) + '/all?includeGuids=1';
+        if (recortar) {
+            url += '&excludeFields=' + encodeURIComponent(PLEX_FUERA_CAMPOS) +
+                   '&excludeElements=' + encodeURIComponent(PLEX_FUERA_ELEMENTOS);
+        }
+        return url;
+    }
+
+    // Guid es justo el elemento que no se puede perder: sin él todo pasaría a
+    // emparejarse por título y año, que es el último recurso y menos fiable, y
+    // además sin aviso. Si el recorte deja la biblioteca sin ningún identificador
+    // —porque el servidor entienda excludeElements de otra manera— o la rechaza
+    // de plano, se pide otra vez sin recortar nada. Una petición de más en el
+    // caso raro; precisión intacta en todos.
+    async function pedirBiblioteca(root, hdr, key) {
+        try {
+            const data = await gmJSON({ url: urlBiblioteca(root, key, true), headers: hdr });
+            const list = (data.MediaContainer || {}).Metadata || [];
+            const conGuid = list.some(function (it) { return guidsOf(it).length > 0; });
+            if (!list.length || conGuid) return data;
+        } catch (e) { /* se reintenta sin recortar */ }
+        return gmJSON({ url: urlBiblioteca(root, key, false), headers: hdr });
+    }
+
     async function buildPlexIndex() {
         if (!CFG.plexUrl || !CFG.plexToken) throw new Error('Plex sin configurar');
         const root = base(CFG.plexUrl);
         const hdr = plexHeaders();
 
-        let machine = '';
-        try {
-            const ident = await gmJSON({ url: root + '/identity', headers: hdr });
-            machine = (ident.MediaContainer || {}).machineIdentifier || '';
-        } catch (e) { /* el enlace profundo es opcional */ }
+        // El identificador del servidor sólo hace falta para el enlace profundo,
+        // al pulsar un distintivo. Esperarlo antes de preguntar por las
+        // bibliotecas ponía una ida y vuelta de más delante de la descarga
+        // pesada: se lanza a la vez y se recoge al final, cuando ya ha llegado.
+        const pIdent = gmJSON({ url: root + '/identity', headers: hdr })
+            .then(function (i) { return (i.MediaContainer || {}).machineIdentifier || ''; },
+                  function () { return ''; });
 
         const secs = await gmJSON({ url: root + '/library/sections', headers: hdr });
         const dirs = ((secs.MediaContainer || {}).Directory || [])
@@ -929,10 +1137,7 @@
         // Las bibliotecas se piden a la vez: son con diferencia la descarga más
         // pesada del arranque, y encadenarlas sumaba una espera detrás de otra.
         const bibliotecas = await Promise.all(dirs.map(function (d) {
-            return gmJSON({
-                url: root + '/library/sections/' + encodeURIComponent(d.key) + '/all?includeGuids=1',
-                headers: hdr
-            });
+            return pedirBiblioteca(root, hdr, d.key);
         }));
 
         for (const data of bibliotecas) {
@@ -944,7 +1149,12 @@
                 // del que venga: tmdb://8592 es Dick Tracy entre las películas
                 // y Parks and Recreation entre las series.
                 const medio = it.type === 'show' ? 'tv' : 'movie';
-                const ref = { r: it.ratingKey, t: it.type };
+                // Antes se guardaba {r, t}: el tipo no se leía en ninguna parte
+                // —va ya delante de la clave— y multiplicaba por cuatro los
+                // objetos que hay que construir al leer el índice guardado. Se
+                // guarda el ratingKey pelado, siempre como cadena para que un
+                // "0" no se confunda con la ausencia de coincidencia.
+                const ref = String(it.ratingKey);
                 for (const g of guidsOf(it)) {
                     guid[medio + '|' + g] = ref;
                     if (g.indexOf('imdb:') === 0) conImdb++;
@@ -955,7 +1165,10 @@
             }
         }
 
-        return { machine: machine, guid: guid, byTitle: byTitle, count: items, imdb: conImdb };
+        return {
+            machine: await pIdent, guid: guid, byTitle: byTitle,
+            count: items, imdb: conImdb
+        };
     }
 
     async function buildRadarrIndex() {
@@ -977,6 +1190,13 @@
         const root = base(CFG.sonarrUrl);
         const hdr = { 'X-Api-Key': CFG.sonarrKey };
 
+        // La versión sólo hace falta al dar de alta una serie, no para construir
+        // el índice: las dos peticiones salen juntas en vez de una detrás de otra.
+        const pSeries = gmJSON({ url: root + '/api/v3/series', headers: hdr });
+        // El error se trata en el await de más abajo; esto sólo evita que la
+        // promesa pase por rechazo sin atender mientras se espera la versión.
+        pSeries.catch(function () {});
+
         let major = 4, languageProfileId = null;
         try {
             const status = await gmJSON({ url: root + '/api/v3/system/status', headers: hdr });
@@ -991,7 +1211,7 @@
             } catch (e) { /* opcional */ }
         }
 
-        const list = await gmJSON({ url: root + '/api/v3/series', headers: hdr });
+        const list = await pSeries;
         const byTvdb = {}, byTmdb = {};
         for (const s of list) {
             const st = s.statistics || {};
@@ -1020,46 +1240,139 @@
 
     const BUILDERS = { plex: buildPlexIndex, radarr: buildRadarrIndex, sonarr: buildSonarrIndex };
 
+    const SERVICIOS = ['plex', 'radarr', 'sonarr'];
+
+    // Una promesa por servicio. Antes había una sola, agregada, y un distintivo
+    // de película esperaba también a Sonarr y uno de serie a Radarr: con Sonarr
+    // lento o apagado no se pintaba ni una película, aunque Plex llevara rato
+    // en memoria.
+    const READY = { plex: null, radarr: null, sonarr: null };
+
     let indexesReady = null;
 
+    // Guardar un índice cuando ya no hay nada esperándolo: serializar el
+    // catálogo de Plex son decenas de milisegundos de hilo principal, y caían
+    // justo en el instante en que se desbloquean los distintivos.
+    const enReposo = window.requestIdleCallback
+        ? function (fn) { window.requestIdleCallback(fn, { timeout: 2000 }); }
+        : function (fn) { setTimeout(fn, 1); };
+
+    const PENDIENTE_GUARDAR = new Set();
+
+    function guardarServicio(name) {
+        const data = IDX[name];
+        if (!data || data.error || data.stale) return;
+        PENDIENTE_GUARDAR.add(name);
+        enReposo(function () { volcarIndices(); });
+    }
+
+    function volcarIndices() {
+        PENDIENTE_GUARDAR.forEach(function (name) {
+            const data = IDX[name];
+            if (!data || data.error || data.stale) return;
+            try {
+                writeJSON(IDX_KEYS[name], { ts: Date.now(), v: IDX_VERSION, data: data });
+            } catch (e) { /* si no cabe, se reconstruye al caducar */ }
+        });
+        PENDIENTE_GUARDAR.clear();
+    }
+
+    // La revalidación no entra en READY a propósito: si entrara, pintar volvería
+    // a esperar la descarga y lo guardado no serviría de nada, que es justo lo
+    // que se quiere evitar. Se guarda aparte, para que dos avisos no lancen dos
+    // descargas y para que quien de verdad necesite el dato al día pueda
+    // esperarla (ver indiceAlDia).
+    const REVALIDANDO = new Map();
+
+    // Repinta sólo los distintivos a los que este servicio puede cambiarles el
+    // estado, en vez de todos.
+    function repintarServicio(name) {
+        refreshMatching(function (c) {
+            if (name === 'plex') return true;
+            const esSerie = c._match.kind === 'tv';
+            return name === 'sonarr' ? esSerie : !esSerie;
+        });
+    }
+
+    // Se sirve lo guardado aunque haya caducado y se refresca detrás. Antes, un
+    // índice de hace siete horas con la caducidad en seis se tiraba sin mirarlo
+    // y la primera pintada se quedaba esperando la descarga entera: cualquier
+    // rato de navegación que empezara pasado el plazo pagaba el arranque
+    // completo. Lo rancio se corrige en cuanto llega lo nuevo.
+    function revalidar(name) {
+        const enCurso = REVALIDANDO.get(name);
+        if (enCurso) return enCurso;
+        const tarea = BUILDERS[name]()
+            .then(function (data) {
+                IDX[name] = data;
+                guardarServicio(name);
+                progServicio(name, 'listo');
+                repintarServicio(name);
+            })
+            .catch(function () { /* se sigue con lo rancio */ })
+            .then(function () { REVALIDANDO.delete(name); });
+        REVALIDANDO.set(name, tarea);
+        return tarea;
+    }
+
     async function loadIndexes(force) {
-        const cached = readMap(IDX_KEY);
         // Un valor no numérico daba NaN, y con NaN ningún índice era fresco:
         // se volvía a descargar todo en cada carga.
         const horas = parseInt(CFG.indexTtlHours, 10);
         const ttl = Math.max(1, isFinite(horas) ? horas : 6) * 3600 * 1000;
         const jobs = [];
 
-        for (const name of ['plex', 'radarr', 'sonarr']) {
-            const entry = cached[name];
-            const util  = entry && entry.v === IDX_VERSION;
+        for (const name of SERVICIOS) {
+            // Con force se va a descargar todo: ni se lee lo guardado.
+            const entry = force ? null : readMap(IDX_KEYS[name]);
+            const util  = entry && entry.v === IDX_VERSION && entry.data;
             const fresh = util && (Date.now() - entry.ts) < ttl;
-            if (!force && fresh) {
-                IDX[name] = entry.data;
+
+            if (util) {
+                IDX[name] = fresh ? entry.data
+                                  : Object.assign({}, entry.data, { stale: true });
                 progServicio(name, 'listo');
+                READY[name] = Promise.resolve();
+                // El refresco va por detrás, sin que nadie lo espere.
+                if (!fresh) revalidar(name);
                 continue;
             }
+
             progServicio(name, 'cargando');
-            jobs.push(
-                BUILDERS[name]()
-                    .then(function (data) {
-                        IDX[name] = data;
-                        cached[name] = { ts: Date.now(), v: IDX_VERSION, data: data };
-                        progServicio(name, 'listo');
-                    })
-                    .catch(function (err) {
-                        IDX[name] = { error: err.message || String(err) };
-                        if (util) IDX[name] = Object.assign({}, entry.data, { stale: true });
-                        progServicio(name, 'error');
-                    })
-            );
+            const tarea = BUILDERS[name]()
+                .then(function (data) {
+                    IDX[name] = data;
+                    guardarServicio(name);
+                    progServicio(name, 'listo');
+                })
+                .catch(function (err) {
+                    IDX[name] = { error: err.message || String(err) };
+                    progServicio(name, 'error');
+                });
+            READY[name] = tarea;
+            jobs.push(tarea);
         }
 
         await Promise.all(jobs);
-        // Guardar el índice entero cuesta un buen rato cuando la biblioteca es
-        // grande: solo se reescribe si de verdad se ha descargado algo.
-        if (jobs.length) writeJSON(IDX_KEY, cached);
         return IDX;
+    }
+
+    // Lo que de verdad hay que esperar para pintar un título: Plex y el servicio
+    // que le corresponde por tipo. El otro no se consulta nunca.
+    function indicesPara(kind) {
+        const otro = kind === 'tv' ? READY.sonarr : READY.radarr;
+        return Promise.all([READY.plex, otro].filter(Boolean));
+    }
+
+    // Con el índice rancio, un alta puede mandar algo que ya estaba y volver con
+    // un 400 "ya estaba añadida", o mandar a Radarr una película que ya está en
+    // Plex. Antes de dar de alta se espera a que lo que se va a consultar esté
+    // al día; cuesta sólo al pulsar, no al pintar.
+    function indiceAlDia(kind) {
+        const nombres = ['plex', kind === 'tv' ? 'sonarr' : 'radarr'];
+        return Promise.all(nombres.map(function (name) {
+            return (IDX[name] && IDX[name].stale) ? revalidar(name) : null;
+        }).filter(Boolean));
     }
 
     function ensureIndexes(force) {
@@ -1113,7 +1426,7 @@
 
         let estado;
         if (hit) {
-            estado = { state: 'plex', ratingKey: hit.r, machine: plex.machine || '', arr: arr, tvdb: tvdb };
+            estado = { state: 'plex', ratingKey: hit, machine: plex.machine || '', arr: arr, tvdb: tvdb };
         } else if (arr) {
             const hasFiles = match.kind === 'tv' ? arr.files > 0 : arr.files === 1;
             estado = { state: hasFiles ? 'downloaded' : 'queued', arr: arr, tvdb: tvdb };
@@ -1320,13 +1633,7 @@
     // guardado seguía diciendo que no la tenías durante las seis horas de
     // caducidad, y volver a pulsar acababa en un 400 "ya estaba añadida".
     function guardarIndices() {
-        try {
-            const cache = readMap(IDX_KEY);
-            ['plex', 'radarr', 'sonarr'].forEach(function (n) {
-                if (IDX[n] && !IDX[n].error && cache[n]) cache[n].data = IDX[n];
-            });
-            writeJSON(IDX_KEY, cache);
-        } catch (e) { /* si no cabe, se reconstruye al caducar */ }
+        SERVICIOS.forEach(guardarServicio);
     }
 
     async function sendToService(match, status) {
@@ -1444,37 +1751,41 @@
 
     function mountCard(card) {
         const meta = extractFromCard(card);
-        if (!meta.faId || !/^\d+$/.test(meta.faId)) return;
-        if (SELF_FILM_ID && meta.faId === SELF_FILM_ID) return;
+        if (!meta.faId || !/^\d+$/.test(meta.faId)) return marcar(card);
+        if (SELF_FILM_ID && meta.faId === SELF_FILM_ID) return marcar(card);
         const host = card.querySelector('.mc-poster') ||
                      card.querySelector('.poster-col a') ||
                      card.querySelector('.poster-col');
         if (host) {
-            if (hasChip(host)) return;
+            if (hasChip(host)) return marcar(card);
             host.classList.add('fam-wrap');
             const chip = makeChip(meta, 'corner');
             host.appendChild(chip);
             io.observe(chip);
+            marcar(card);
             return;
         }
         // Sin póster no había dónde colgarlo, y mountAnchor descarta todo enlace
         // que esté dentro de una .movie-card: la tarjeta se quedaba sin ningún
         // distintivo. El enlace del título sirve igual.
         const titulo = card.querySelector('.mc-title a') || card.querySelector('a[href*="/film"]');
+        // Sin enlace de título la tarjeta puede estar a medio construir: no se
+        // marca, para volver a mirarla en el siguiente repaso.
         if (!titulo || !titulo.parentElement) return;
-        if (titulo.parentElement.querySelector(':scope > .fam-chip')) return;
+        if (titulo.parentElement.querySelector(':scope > .fam-chip')) return marcar(card);
         const chip = makeChip(meta, 'inline');
         titulo.insertAdjacentElement('afterend', chip);
         io.observe(chip);
+        marcar(card);
     }
 
     const SELF_FILM_ID = idFromHref(location.pathname);
 
     function mountAnchor(a) {
-        if (a.closest('.movie-card') || a.closest('.fam-ui')) return;
+        if (a.closest('.movie-card') || a.closest('.fam-ui')) return marcar(a);
         const meta = extractFromAnchor(a);
-        if (!meta.faId) return;
-        if (SELF_FILM_ID && meta.faId === SELF_FILM_ID) return;   // enlace a la propia ficha
+        if (!meta.faId) return marcar(a);
+        if (SELF_FILM_ID && meta.faId === SELF_FILM_ID) return marcar(a);   // enlace a la propia ficha
 
         // La misma ficha, enlazada dos veces dentro del mismo bloque, sacaba dos
         // distintivos: cada rama deduplicaba con un criterio distinto.
@@ -1483,31 +1794,33 @@
             const yaEsta = Array.prototype.some.call(bloque.querySelectorAll('.fam-chip'), function (n) {
                 return n._meta && n._meta.faId === meta.faId;
             });
-            if (yaEsta) return;
+            if (yaEsta) return marcar(a);
         }
 
         const img = a.querySelector('img');
         if (img) {
             const host = a.querySelector('.mc-oposter, .fa-movie-poster') || a;
-            if (hasChip(host)) return;
+            if (hasChip(host)) return marcar(a);
             host.classList.add('fam-wrap');
             const chip = makeChip(meta, 'corner');
             host.appendChild(chip);
             io.observe(chip);
+            marcar(a);
         } else {
             // Capas transparentes e iconos: enlazan a la ficha pero no son el
             // título, y sin texto el distintivo sale con la etiqueta vacía.
-            if (!(a.textContent || '').trim()) return;
+            if (!(a.textContent || '').trim()) return marcar(a);
             const host = a.parentElement;
             if (!host) return;
             const dup = Array.prototype.some.call(host.children, function (n) {
                 return n.classList && n.classList.contains('fam-chip') &&
                        n._meta && n._meta.faId === meta.faId;
             });
-            if (dup) return;
+            if (dup) return marcar(a);
             const chip = makeChip(meta, 'inline');
             a.insertAdjacentElement('afterend', chip);
             io.observe(chip);
+            marcar(a);
         }
     }
 
@@ -1521,18 +1834,41 @@
         // no se guarda. Guardarla dejaba la película envenenada en la caché.
         if (meta && (meta.original || meta.year || meta.title)) {
             store.meta[faId] = meta;
-            flushSoon();
+            flushSoon('meta');
         }
         const chip = makeChip(meta, 'big');
         h1.appendChild(chip);
         process(chip);   // en la ficha no se espera al scroll
     }
 
+    // Un nodo ya resuelto no vuelve a mirarse. Antes, cada mutación de la página
+    // —el perezoso de las imágenes, los carruseles, la publicidad— repasaba
+    // todos los enlaces del documento otra vez, y por cada uno repetía el
+    // closest, la extracción y el recuento de distintivos del bloque, que es
+    // cuadrático dentro de cada contenedor.
+    //
+    // Sólo se marca lo que ya tiene distintivo o lo que se descarta por una
+    // razón que no va a cambiar: una tarjeta a medio construir tiene que poder
+    // mirarse otra vez cuando esté entera.
+    const VISTO = 'data-fam';
+
+    function marcar(nodo) {
+        if (nodo && nodo.setAttribute) nodo.setAttribute(VISTO, '1');
+    }
+
+    const SEL_CARD  = 'div.movie-card[data-movie-id]:not([' + VISTO + '])';
+    const SEL_ANCLA = 'a[href*="/film"]:not([' + VISTO + '])';
+
     function scan(root) {
         root = root || document;
-        if (isFichaPage()) mountFicha();
-        root.querySelectorAll('div.movie-card[data-movie-id]').forEach(mountCard);
-        root.querySelectorAll('a[href*="/film"]').forEach(mountAnchor);
+        // querySelectorAll no mira el propio nodo, y al repasar sólo lo que ha
+        // entrado el nodo que entra puede ser él mismo la tarjeta o el enlace.
+        if (root.matches) {
+            if (root.matches(SEL_CARD)) mountCard(root);
+            else if (root.matches(SEL_ANCLA)) mountAnchor(root);
+        }
+        root.querySelectorAll(SEL_CARD).forEach(mountCard);
+        root.querySelectorAll(SEL_ANCLA).forEach(mountAnchor);
     }
 
     /* ================================================================== *
@@ -1550,7 +1886,7 @@
             // Identificar el título en TMDB no necesita los índices de Plex,
             // Radarr y Sonarr: lanzados a la vez, las dos esperas se solapan en
             // vez de sumarse. El índice solo hace falta al pintar el estado.
-            const indices = ensureIndexes(false);
+            ensureIndexes(false);
             const r = await resolveMatchUnaVez(meta);
             chip._candidates = r.candidates || [];
             chip._meta = r.meta || meta;
@@ -1561,7 +1897,7 @@
                 return;
             }
             chip._match = r.match;
-            await indices;
+            await indicesPara(r.match.kind);
             await applyStatus(chip);
         } catch (e) {
             setChip(chip, 'error', e.message || String(e));
@@ -1623,6 +1959,19 @@
         ENVIANDO.add(clave);
         setChip(chip, 'busy', 'Enviando a ' + service);
         try {
+            // Si el índice estaba rancio se refresca antes de mandar nada, y
+            // sólo en ese caso se vuelve a mirar: puede que lo nuevo diga que ya
+            // la tenías, y entonces el alta sobra —acabaría en un 400 "ya estaba
+            // añadida"— y lo que toca es repintar el distintivo con la verdad.
+            const refrescados = await indiceAlDia(match.kind);
+            if (refrescados.length) {
+                const ya = await statusFor(match, (chip._meta && chip._meta.season) || null);
+                if (ya.state !== 'missing') {
+                    await applyStatus(chip);
+                    toast('Ya la tenias: ' + (match.title || ''));
+                    return;
+                }
+            }
             await sendToService(match, chip._status);
             guardarIndices();
             toast('Enviada a ' + service + ': ' + (match.title || ''));
@@ -1701,7 +2050,7 @@
         if (!cands.length) {
             try {
                 const meta = Object.assign({}, chip._meta, store.meta[chip._meta.faId] || {});
-                const out = await queue(function () { return attemptMatch(meta); });
+                const out = await attemptMatch(meta);
                 cands = out.candidates || [];
                 chip._candidates = cands;
             } catch (e) { cands = []; }
@@ -1930,7 +2279,7 @@
                 if (!PROG.verTimer) PROG.verTimer = setTimeout(progMostrar, 500);
                 return;
             }
-            progPintar();
+            progPedirPintura();
             return;
         }
 
@@ -1942,6 +2291,21 @@
             const fallos = progServiciosEn('error').length > 0;
             PROG.ocultarTimer = setTimeout(progOcultar, fallos ? 7000 : 1600);
         }
+    }
+
+    // process llama dos veces por título —al entrar y al salir—, así que con cien
+    // distintivos salían doscientas asignaciones de anchura, cada una
+    // reiniciando la transición de CSS y provocando su reflujo. Se agrupan en
+    // una por fotograma.
+    let progRafPend = false;
+
+    function progPedirPintura() {
+        if (progRafPend) return;
+        progRafPend = true;
+        requestAnimationFrame(function () {
+            progRafPend = false;
+            if (PROG.visible && !PROG.terminado) progPintar();
+        });
     }
 
     function progServicio(nombre, estado) {
@@ -2181,7 +2545,8 @@
             const d = IDX[k];
             if (!d) info.push(k + ': sin cargar');
             else if (d.error) info.push(k + ': ' + d.error);
-            else info.push(k + ': ' + (d.count || 0) + ' elementos');
+            else info.push(k + ': ' + (d.count || 0) + ' elementos' +
+                           (d.stale ? ' (refrescando)' : ''));
         });
         $('idxInfo').textContent = 'Indices - ' + info.join('  |  ');
 
@@ -2279,14 +2644,39 @@
      * 15. Arranque
      * ================================================================== */
 
+    // El retraso de 400 ms se reprogramaba con cada mutación y no tenía tope: en
+    // una página que no para de moverse —anuncios, carruseles— el repaso podía
+    // posponerse indefinidamente, justo lo contrario de lo que se buscaba. Ahora
+    // se agrupa en lotes cortos, pero nunca se espera más de un cuarto de
+    // segundo desde la primera mutación del lote. Y se repasa sólo lo que ha
+    // entrado, no el documento entero.
     let scanTimer = null;
-    function scheduleScan() {
+    let scanLote = new Set();
+    let scanTope = 0;
+
+    function scheduleScan(nodo) {
+        if (nodo) scanLote.add(nodo);
+        const ahora = Date.now();
+        if (!scanTope) scanTope = ahora + 250;
         clearTimeout(scanTimer);
-        scanTimer = setTimeout(function () { scan(document); }, 400);
+        scanTimer = setTimeout(correrScan, Math.max(0, Math.min(80, scanTope - ahora)));
+    }
+
+    function correrScan() {
+        scanTimer = null;
+        scanTope = 0;
+        const lote = scanLote;
+        scanLote = new Set();
+        if (isFichaPage()) mountFicha();
+        if (!lote.size) return scan(document);
+        lote.forEach(function (n) {
+            // Un nodo que ya no está en el documento no tiene nada que montar.
+            if (n.isConnected) scan(n);
+        });
     }
 
     function boot() {
-        GM_addStyle(STYLE);
+        if (isFichaPage()) mountFicha();
 
         GM_registerMenuCommand('FA-Monkey: ajustes', openSettings);
         GM_registerMenuCommand('FA-Monkey: refrescar indices', function () {
@@ -2301,6 +2691,7 @@
             store.map = {}; store.meta = {}; store.tvdb = {};
             store.imdb = {};
             clearTimeout(flushTimer); flushTimer = null;
+            SUCIOS.clear();
             writeJSON(MAP_KEY, {}); writeJSON(META_KEY, {}); writeJSON(TVDB_KEY, {}); writeJSON(IMDB_KEY, {});
             toast('Cache borrada. Recarga la pagina.');
         });
@@ -2309,21 +2700,83 @@
             toast('FA-Monkey necesita configurarse: menu de Tampermonkey, FA-Monkey ajustes', false, 9000);
         }
 
+        // Los índices pueden llevar rato cargándose desde antes de que hubiera
+        // body, y progRender se salta sin body: se pinta una vez al llegar aquí
+        // para que el aviso de la primera carga siga asomando.
+        progRender();
+
         scan(document);
 
+        // Antes se salía en el primer nodo útil y se repasaba el documento
+        // entero: se recogen todos los subárboles del lote y se mira sólo eso.
         const mo = new MutationObserver(function (muts) {
+            let hay = false;
             for (const m of muts) {
                 for (const n of m.addedNodes) {
-                    if (n.nodeType === 1 && !(n.classList && n.classList.contains('fam-ui'))) {
-                        scheduleScan();
-                        return;
+                    if (n.nodeType !== 1) continue;
+                    if (n.classList && n.classList.contains('fam-ui')) continue;
+                    if (n.classList && n.classList.contains('fam-chip')) continue;
+                    scanLote.add(n);
+                    // Si lo que ha cambiado está dentro de algo ya resuelto, ese
+                    // algo se ha vuelto a construir y puede haberse quedado sin
+                    // distintivo: se le quita la marca para volver a mirarlo.
+                    const dentroDe = n.parentElement && n.parentElement.closest('[' + VISTO + ']');
+                    if (dentroDe) {
+                        dentroDe.removeAttribute(VISTO);
+                        scanLote.add(dentroDe);
                     }
+                    hay = true;
                 }
             }
+            if (hay) scheduleScan();
         });
         mo.observe(document.body, { childList: true, subtree: true });
     }
 
-    if (document.body) boot();
-    else document.addEventListener('DOMContentLoaded', boot);
+    // Lo que tarda de verdad es bajar el catálogo de Plex, y no salía ni una
+    // petición hasta que el primer póster entraba en pantalla: después de que el
+    // navegador hubiera parseado la página, montado los distintivos y hecho el
+    // primer reparto. Con la cabecera en document-start se pide ya, mientras
+    // FilmAffinity sigue cargando, y las dos esperas se solapan en vez de
+    // sumarse. Lo que necesita DOM espera; esto no.
+    function arrancarIndices() {
+        if (!CFG.plexToken && !CFG.radarrKey && !CFG.sonarrKey) return;
+        try { ensureIndexes(false); } catch (e) { /* se reintenta al primer chip */ }
+    }
+
+    // GM_addStyle necesita un sitio donde colgar la hoja, y en document-start
+    // puede que todavía no haya head.
+    let estilosPuestos = false;
+    function estilos() {
+        if (estilosPuestos || !(document.head || document.body)) return;
+        // La bandera se pone al conseguirlo, no antes: si falla, se reintenta
+        // cuando el documento esté montado, en vez de quedarse sin estilos.
+        try {
+            GM_addStyle(STYLE);
+            estilosPuestos = true;
+        } catch (e) { /* se reintenta en DOMContentLoaded */ }
+    }
+
+    // El índice vivía en un solo valor con los tres servicios dentro. Lo de la
+    // forma vieja no sirve y no se va a volver a leer: se tira una vez, para no
+    // dejarlo ocupando sitio en el almacén.
+    function limpiarIndiceViejo() {
+        try {
+            if (GM_getValue(IDX_KEY, null) !== null) GM_deleteValue(IDX_KEY);
+        } catch (e) { /* da igual */ }
+    }
+
+    arrancarIndices();
+    limpiarIndiceViejo();
+    estilos();
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', function () {
+            estilos();
+            boot();
+        }, { once: true });
+    } else {
+        estilos();
+        boot();
+    }
 })();
